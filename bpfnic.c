@@ -15,8 +15,7 @@
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
 #include <linux/u64_stats_sync.h>
-
-#include <net/rtnetlink.h>
+#include <linux/platform_device.h>
 #include <net/dst.h>
 #include <net/xfrm.h>
 #include <linux/module.h>
@@ -27,6 +26,8 @@
 
 #define DRV_NAME	"bpfnic"
 #define DRV_VERSION	"0.1"
+
+#define MAX_QUEUES 128
 
 enum {
 	BPFNIC_INFO_UNSPEC,
@@ -53,6 +54,7 @@ struct bpfnic_rq {
 	struct net_device	*dev;
 };
 
+static int unit;
 
 /*
  * ethtool interface
@@ -222,6 +224,7 @@ static int bpfnic_close(struct net_device *dev)
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer = rtnl_dereference(priv->peer);
 
+	netif_tx_stop_all_queues(dev);
 	netif_carrier_off(dev);
 	if (peer)
 		netif_carrier_off(peer);
@@ -240,6 +243,7 @@ static int bpfnic_dev_init(struct net_device *dev)
 	struct bpfnic_priv *priv = netdev_priv(dev);
 
 	kernel_param_lock(THIS_MODULE);
+	snprintf(dev->name, sizeof(dev->name), "bpfnic%d", unit++);
 
 	priv->peername = kstrdup(target_iface, GFP_KERNEL);
 
@@ -247,6 +251,7 @@ static int bpfnic_dev_init(struct net_device *dev)
 		err = -ENOMEM;
 
 	kernel_param_unlock(THIS_MODULE);
+	eth_hw_addr_random(dev);
 
 	rcu_read_lock();
 	priv->peer = dev_get_by_name_rcu(&init_net, priv->peername);
@@ -406,176 +411,6 @@ static void bpfnic_setup(struct net_device *dev)
 	dev->mpls_features = NETIF_F_HW_CSUM | NETIF_F_GSO_SOFTWARE;
 }
 
-/*
- * netlink interface
- */
-
-static int bpfnic_validate(struct nlattr *tb[], struct nlattr *data[],
-			 struct netlink_ext_ack *extack)
-{
-	if (tb[IFLA_ADDRESS]) {
-		if (nla_len(tb[IFLA_ADDRESS]) != ETH_ALEN)
-			return -EINVAL;
-		if (!is_valid_ether_addr(nla_data(tb[IFLA_ADDRESS])))
-			return -EADDRNOTAVAIL;
-	}
-	if (tb[IFLA_MTU]) {
-		if (!is_valid_bpfnic_mtu(nla_get_u32(tb[IFLA_MTU])))
-			return -EINVAL;
-	}
-	return 0;
-}
-
-static struct rtnl_link_ops bpfnic_link_ops;
-
-static int bpfnic_newlink(struct net *src_net, struct net_device *dev,
-			struct nlattr *tb[], struct nlattr *data[],
-			struct netlink_ext_ack *extack)
-{
-	int err;
-	struct net_device *peer;
-	struct bpfnic_priv *priv;
-	char ifname[IFNAMSIZ];
-	struct nlattr *peer_tb[IFLA_MAX + 1], **tbp;
-	unsigned char name_assign_type;
-	struct ifinfomsg *ifmp;
-	struct net *net;
-
-	/*
-	 * create and register peer first
-	 */
-	if (data != NULL && data[BPFNIC_INFO_PEER] != NULL) {
-		struct nlattr *nla_peer;
-
-		nla_peer = data[BPFNIC_INFO_PEER];
-		ifmp = nla_data(nla_peer);
-		err = rtnl_nla_parse_ifla(peer_tb,
-					  nla_data(nla_peer) + sizeof(struct ifinfomsg),
-					  nla_len(nla_peer) - sizeof(struct ifinfomsg),
-					  NULL);
-		if (err < 0)
-			return err;
-
-		err = bpfnic_validate(peer_tb, NULL, extack);
-		if (err < 0)
-			return err;
-
-		tbp = peer_tb;
-	} else {
-		ifmp = NULL;
-		tbp = tb;
-	}
-
-	if (ifmp && tbp[IFLA_IFNAME]) {
-		nla_strscpy(ifname, tbp[IFLA_IFNAME], IFNAMSIZ);
-		name_assign_type = NET_NAME_USER;
-	} else {
-		snprintf(ifname, IFNAMSIZ, DRV_NAME "%%d");
-		name_assign_type = NET_NAME_ENUM;
-	}
-
-	net = rtnl_link_get_net(src_net, tbp);
-	if (IS_ERR(net))
-		return PTR_ERR(net);
-
-	peer = rtnl_create_link(net, ifname, name_assign_type,
-				&bpfnic_link_ops, tbp, extack);
-	if (IS_ERR(peer)) {
-		put_net(net);
-		return PTR_ERR(peer);
-	}
-
-	if (!ifmp || !tbp[IFLA_ADDRESS])
-		eth_hw_addr_random(peer);
-
-	if (ifmp && (dev->ifindex != 0))
-		peer->ifindex = ifmp->ifi_index;
-
-	peer->gso_max_size = dev->gso_max_size;
-	peer->gso_max_segs = dev->gso_max_segs;
-
-	err = register_netdevice(peer);
-	put_net(net);
-	net = NULL;
-	if (err < 0)
-		goto err_register_peer;
-
-	netif_carrier_off(peer);
-
-	err = rtnl_configure_link(peer, ifmp);
-	if (err < 0)
-		goto err_configure_peer;
-
-	/*
-	 * register dev last
-	 *
-	 * note, that since we've registered new device the dev's name
-	 * should be re-allocated
-	 */
-
-	if (tb[IFLA_ADDRESS] == NULL)
-		eth_hw_addr_random(dev);
-
-	if (tb[IFLA_IFNAME])
-		nla_strscpy(dev->name, tb[IFLA_IFNAME], IFNAMSIZ);
-	else
-		snprintf(dev->name, IFNAMSIZ, DRV_NAME "%%d");
-
-	err = register_netdevice(dev);
-	if (err < 0)
-		goto err_register_dev;
-
-	netif_carrier_off(dev);
-
-	/*
-	 * tie the deviced together
-	 */
-
-	priv = netdev_priv(dev);
-	rcu_assign_pointer(priv->peer, peer);
-
-	priv = netdev_priv(peer);
-	rcu_assign_pointer(priv->peer, dev);
-
-	return 0;
-
-err_register_dev:
-	/* nothing to do */
-err_configure_peer:
-	unregister_netdevice(peer);
-	return err;
-
-err_register_peer:
-	free_netdev(peer);
-	return err;
-}
-
-static void bpfnic_dellink(struct net_device *dev, struct list_head *head)
-{
-	struct bpfnic_priv *priv;
-	struct net_device *peer;
-
-	priv = netdev_priv(dev);
-	peer = rtnl_dereference(priv->peer);
-
-	/* Note : dellink() is called from default_device_exit_batch(),
-	 * before a rcu_synchronize() point. The devices are guaranteed
-	 * not being freed before one RCU grace period.
-	 */
-	RCU_INIT_POINTER(priv->peer, NULL);
-	unregister_netdevice_queue(dev, head);
-
-	if (peer) {
-		priv = netdev_priv(peer);
-		RCU_INIT_POINTER(priv->peer, NULL);
-		unregister_netdevice_queue(peer, head);
-	}
-}
-
-static const struct nla_policy bpfnic_policy[BPFNIC_INFO_MAX + 1] = {
-	[BPFNIC_INFO_PEER]	= { .len = sizeof(struct ifinfomsg) },
-};
-
 static struct net *bpfnic_get_link_net(const struct net_device *dev)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
@@ -583,17 +418,53 @@ static struct net *bpfnic_get_link_net(const struct net_device *dev)
 
 	return peer ? dev_net(peer) : dev_net(dev);
 }
+static int __init
+bpfnic_probe(struct platform_device *pdev)
+{
+	struct net_device *dev;
+	int err;
 
-static struct rtnl_link_ops bpfnic_link_ops = {
-	.kind		= DRV_NAME,
-	.priv_size	= sizeof(struct bpfnic_priv),
-	.setup		= bpfnic_setup,
-	.validate	= bpfnic_validate,
-	.newlink	= bpfnic_newlink,
-	.dellink	= bpfnic_dellink,
-	.policy		= bpfnic_policy,
-	.maxtype	= BPFNIC_INFO_MAX,
-	.get_link_net	= bpfnic_get_link_net,
+	dev = alloc_etherdev_mq(sizeof(struct bpfnic_priv), MAX_QUEUES);
+	if (!dev) {
+		err = -ENOMEM;
+		goto err_out;
+	}
+
+	bpfnic_setup(dev);
+
+	err = register_netdev(dev);
+	if (err)
+		goto err_free;
+
+	platform_set_drvdata(pdev, dev);
+	return 0;
+
+err_free:
+	free_netdev(dev);
+err_out:
+	return err;
+}
+
+
+static int
+bpfnic_remove(struct platform_device *pdev)
+{
+	struct net_device *dev = platform_get_drvdata(pdev);
+
+	if (dev) {
+		netif_tx_stop_all_queues(dev);
+		bpfnic_close(dev);
+		unregister_netdev(dev);
+	}
+	return 0;
+}
+
+
+static struct platform_driver bpfnic_driver = {
+	.remove = bpfnic_remove,
+	.driver = {
+		.name = DRV_NAME,
+	},
 };
 
 /*
@@ -602,12 +473,15 @@ static struct rtnl_link_ops bpfnic_link_ops = {
 
 static __init int bpfnic_init(void)
 {
-	return rtnl_link_register(&bpfnic_link_ops);
+    int ret = platform_driver_probe(&bpfnic_driver, bpfnic_probe);
+    if (ret)
+	    pr_err("bpfnic: Error registering platform driver!");
+    return ret;
 }
 
 static __exit void bpfnic_exit(void)
 {
-	rtnl_link_unregister(&bpfnic_link_ops);
+	platform_driver_unregister(&bpfnic_driver);
 }
 
 module_init(bpfnic_init);
