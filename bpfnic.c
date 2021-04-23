@@ -423,6 +423,7 @@ bpfnic_probe(struct platform_device *pdev)
 {
 	struct net_device *dev;
 	int err;
+	pr_info("bpfnic: Platform init start!");
 
 	dev = alloc_etherdev_mq(sizeof(struct bpfnic_priv), MAX_QUEUES);
 	if (!dev) {
@@ -433,8 +434,10 @@ bpfnic_probe(struct platform_device *pdev)
 	bpfnic_setup(dev);
 
 	err = register_netdev(dev);
-	if (err)
+	if (err) {
+		pr_err("bpfnic: Failed to register netdev!");
 		goto err_free;
+	}
 
 	platform_set_drvdata(pdev, dev);
 	return 0;
@@ -473,10 +476,15 @@ static struct platform_driver bpfnic_driver = {
 
 static __init int bpfnic_init(void)
 {
-    int ret = platform_driver_probe(&bpfnic_driver, bpfnic_probe);
-    if (ret)
-	    pr_err("bpfnic: Error registering platform driver!");
-    return ret;
+	int ret;  
+	pr_info("bpfnic: trying to register!"); 
+	ret = platform_driver_probe(&bpfnic_driver, bpfnic_probe);
+	if (ret)
+		pr_err("bpfnic: Error registering platform driver!");
+	else
+		pr_info("bpfnic: registered!");
+
+	return ret;
 }
 
 static __exit void bpfnic_exit(void)
