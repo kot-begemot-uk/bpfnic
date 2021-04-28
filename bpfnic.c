@@ -19,6 +19,7 @@
 #include <net/dst.h>
 #include <net/xfrm.h>
 #include <linux/module.h>
+#include <linux/mod_devicetable.h>
 #include <linux/filter.h>
 #include <linux/ptr_ring.h>
 #include <linux/bpf_trace.h>
@@ -44,37 +45,24 @@ struct bpfnic_stats {
 
 struct bpfnic_priv {
 	struct net_device __rcu	*peer;
-	char 			*peername;	
-	atomic64_t		dropped;
-	struct bpfnic_rq		*rq;
-	unsigned int		requested_headroom;
-};
-
-struct bpfnic_rq {
 	struct net_device	*dev;
+	atomic64_t		rx_packets;
+	atomic64_t		rx_bytes;
+	atomic64_t		dropped;
+	char 			*peername;	
+	unsigned int		requested_headroom;
+	spinlock_t		lock;
+	bool			opened;
 };
 
 static int unit;
+
+static char *target_iface = "";
 
 /*
  * ethtool interface
  */
 
-struct bpfnic_q_stat_desc {
-	char	desc[ETH_GSTRING_LEN];
-	size_t	offset;
-};
-
-static char *target_iface = "";
-
-#define BPFNIC_RQ_STAT(m)	offsetof(struct bpfnic_stats, m)
-
-static const struct bpfnic_q_stat_desc bpfnic_rq_stats_desc[] = {
-	{ "drops",		BPFNIC_RQ_STAT(rx_drops) },
-};
-
-
-#define BPFNIC_Q_STATS_LEN	ARRAY_SIZE(bpfnic_rq_stats_desc)
 
 static void bpfnic_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info)
 {
@@ -91,64 +79,44 @@ static const struct ethtool_ops bpfnic_ethtool_ops = {
 static netdev_tx_t bpfnic_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
-	struct net_device *rcv;
-	int length = skb->len;
+	struct net_device *peer;
 
 	rcu_read_lock();
-	rcv = rcu_dereference(priv->peer);
-	if (unlikely(!rcv)) {
+	peer = rcu_dereference(priv->peer);
+	if (unlikely(!peer)) {
 		kfree_skb(skb);
 		atomic64_inc(&priv->dropped);
 	} else {
 		skb_tx_timestamp(skb);
-		if (likely(dev_forward_skb(rcv, skb) == NET_RX_SUCCESS)) {
-			dev_lstats_add(dev, length);
+		netif_trans_update(dev);
+		netif_wake_queue(dev);
+		skb->dev = peer;
+		if (is_skb_forwardable(skb->dev, skb)) {
+			dev_lstats_add(dev, skb->len);
+			dev_queue_xmit(skb);
 		} else {
 			atomic64_inc(&priv->dropped);
+			kfree_skb(skb);
 		}
 	}
-
 	rcu_read_unlock();
 	return NETDEV_TX_OK;
-}
-
-static u64 bpfnic_stats_tx(struct net_device *dev, u64 *packets, u64 *bytes)
-{
-	struct bpfnic_priv *priv = netdev_priv(dev);
-
-	dev_lstats_read(dev, packets, bytes);
-	return atomic64_read(&priv->dropped);
-}
-
-static void bpfnic_stats_rx(struct bpfnic_stats *result, struct net_device *dev)
-{
-	result->rx_drops = 0;
 }
 
 static void bpfnic_get_stats64(struct net_device *dev,
 			     struct rtnl_link_stats64 *tot)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
-	struct net_device *peer;
-	struct bpfnic_stats rx;
-	u64 packets, bytes;
+	u64 packets = 0, bytes = 0;
 
-	tot->tx_dropped = bpfnic_stats_tx(dev, &packets, &bytes);
-	tot->tx_bytes = bytes;
-	tot->tx_packets = packets;
-
-	bpfnic_stats_rx(&rx, dev);
-
-	rcu_read_lock();
-	peer = rcu_dereference(priv->peer);
-	if (peer) {
-		bpfnic_stats_tx(peer, &packets, &bytes);
-		tot->rx_bytes += bytes;
-		tot->rx_packets += packets;
-
-		bpfnic_stats_rx(&rx, peer);
-	}
-	rcu_read_unlock();
+	if (!tot)
+		return;
+	dev_lstats_read(dev, &packets, &bytes);
+	tot->tx_bytes += bytes;
+	tot->tx_packets += packets;
+	tot->rx_bytes += atomic64_read(&priv->rx_bytes);
+	tot->rx_packets += atomic64_read(&priv->rx_packets);
+	tot->tx_dropped += atomic64_read(&priv->dropped);
 }
 
 /* fake multicast ability */
@@ -182,14 +150,22 @@ static rx_handler_result_t bpfnic_handle_frame(struct sk_buff **pskb)
 
 	/* bpf program invocation goes in here */
 
+	atomic64_inc(&priv->rx_packets);
+	atomic64_add(skb->len, &priv->rx_bytes);
+
 	if (priv) {
-		skb->dev = priv->peer;
+		skb->dev = priv->dev;
 		skb_forward_csum(skb);
+		if (is_multicast_ether_addr(eth_hdr(skb)->h_dest) ||
+				ether_addr_equal(eth_hdr(skb)->h_dest, priv->dev->dev_addr)) {
+			netif_receive_skb(skb);
+			return RX_HANDLER_CONSUMED;
+		} 
 	} else {
 		kfree_skb(skb);
 		return RX_HANDLER_CONSUMED;
+		
 	}
-
 	return RX_HANDLER_ANOTHER;
 }
 
@@ -197,26 +173,58 @@ static int bpfnic_open(struct net_device *dev)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer = rtnl_dereference(priv->peer);
+	int ret = 0;
 
-	if (!peer)
-		return -ENOTCONN;
+	spin_lock(&priv->lock);
+	if (priv->opened) {
+		netdev_err(dev, "Already opened");
+		ret = -ENXIO;
+		goto done_open;
+	}
+
+	if (!peer) {
+		netdev_err(dev, "Cannot deref peer");
+		ret = -ENOTCONN;
+		goto done_open;
+	}
+
+	priv->dev = dev;
+	atomic64_set(&priv->dropped, 0);
+	atomic64_set(&priv->rx_packets, 0);
+	atomic64_set(&priv->rx_bytes, 0);
+
+	netif_set_real_num_tx_queues(dev,
+			priv->peer->real_num_tx_queues);
+	netif_set_real_num_rx_queues(dev,
+			priv->peer->real_num_rx_queues);
+	
+	
 
 	if (peer->flags & IFF_UP) {
 		netif_carrier_on(dev);
 		netif_carrier_on(peer);
 	}
 
-	if (dev->netdev_ops->ndo_start_xmit == bpfnic_xmit) {
-		netdev_err(dev, "Can not attach a bpfnic to another bpfnic");
-		return -ELOOP;
+	if (peer->netdev_ops->ndo_start_xmit == bpfnic_xmit) {
+		ret = -ELOOP;
+		goto done_open;
 	}
 
-	if (netdev_rx_handler_register(priv->peer, bpfnic_handle_frame, priv))
-		return -ENOTCONN;
-	
+	if (netdev_rx_handler_register(priv->peer, bpfnic_handle_frame, priv)) {
+		ret = -ENOTCONN;
+	}
 	dev->features = peer->features;
+	dev->hw_features = peer->hw_features;
+	dev->hw_enc_features = peer->hw_enc_features;
+	dev->mpls_features = peer->mpls_features;
 
-	return 0;
+	if (!ret)
+		priv->opened = true;
+
+	spin_unlock(&priv->lock);
+
+done_open:
+	return ret;
 }
 
 static int bpfnic_close(struct net_device *dev)
@@ -245,13 +253,14 @@ static int bpfnic_dev_init(struct net_device *dev)
 	kernel_param_lock(THIS_MODULE);
 	snprintf(dev->name, sizeof(dev->name), "bpfnic%d", unit++);
 
+	priv->peer = NULL;
 	priv->peername = kstrdup(target_iface, GFP_KERNEL);
+	spin_lock_init(&priv->lock);
 
 	if (!priv->peername)
 		err = -ENOMEM;
 
 	kernel_param_unlock(THIS_MODULE);
-	eth_hw_addr_random(dev);
 
 	rcu_read_lock();
 	priv->peer = dev_get_by_name_rcu(&init_net, priv->peername);
@@ -260,11 +269,19 @@ static int bpfnic_dev_init(struct net_device *dev)
 	if (!priv->peer)
 		err = -EINVAL;
 
-	if (err != 0) {
+	if (priv->peer)
+		eth_hw_addr_inherit(dev, priv->peer);
+	else 
+		eth_hw_addr_random(dev);
+
+	priv->opened = false;
+
+	if (err == 0) {
 		dev->lstats = netdev_alloc_pcpu_stats(struct pcpu_lstats);
 		if (!dev->lstats)
 			err = -ENOMEM;
 	}
+
 	return 0;
 }
 
@@ -287,8 +304,7 @@ static void bpfnic_poll_controller(struct net_device *dev)
 	 * there is nothing to do here.
 	 *
 	 * We need this though so netpoll recognizes us as an interface that
-	 * supports polling, which enables bridge devices in virt setups to
-	 * still use netconsole
+	 * supports polling
 	 */
 }
 #endif	/* CONFIG_NET_POLL_CONTROLLER */
@@ -378,37 +394,22 @@ static const struct net_device_ops bpfnic_netdev_ops = {
 	.ndo_get_peer_dev	= bpfnic_peer_dev,
 };
 
-#define BPFNIC_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HW_CSUM | \
-		       NETIF_F_RXCSUM | NETIF_F_SCTP_CRC | NETIF_F_HIGHDMA | \
-		       NETIF_F_GSO_SOFTWARE | NETIF_F_GSO_ENCAP_ALL | \
-		       NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX | \
-		       NETIF_F_HW_VLAN_STAG_TX | NETIF_F_HW_VLAN_STAG_RX )
-
 static void bpfnic_setup(struct net_device *dev)
 {
 	ether_setup(dev);
 
-	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
-	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
-	dev->priv_flags |= IFF_NO_QUEUE;
-	dev->priv_flags |= IFF_PHONY_HEADROOM;
-
+	
 	dev->netdev_ops = &bpfnic_netdev_ops;
 	dev->ethtool_ops = &bpfnic_ethtool_ops;
-	dev->features |= NETIF_F_LLTX;
-	dev->features |= BPFNIC_FEATURES;
-	dev->vlan_features = dev->features &
-			     ~(NETIF_F_HW_VLAN_CTAG_TX |
-			       NETIF_F_HW_VLAN_STAG_TX |
-			       NETIF_F_HW_VLAN_CTAG_RX |
-			       NETIF_F_HW_VLAN_STAG_RX);
+
 	dev->needs_free_netdev = true;
 	dev->priv_destructor = bpfnic_dev_free;
-	dev->max_mtu = ETH_MAX_MTU;
 
-	dev->hw_features = BPFNIC_FEATURES;
-	dev->hw_enc_features = BPFNIC_FEATURES;
-	dev->mpls_features = NETIF_F_HW_CSUM | NETIF_F_GSO_SOFTWARE;
+	dev->max_mtu = ETH_MAX_MTU;
+	dev->features = 0;
+	dev->hw_features = 0;
+	dev->hw_enc_features = 0;
+	dev->mpls_features = 0;
 }
 
 static struct net *bpfnic_get_link_net(const struct net_device *dev)
@@ -418,12 +419,11 @@ static struct net *bpfnic_get_link_net(const struct net_device *dev)
 
 	return peer ? dev_net(peer) : dev_net(dev);
 }
-static int __init
+static int
 bpfnic_probe(struct platform_device *pdev)
 {
 	struct net_device *dev;
-	int err;
-	pr_info("bpfnic: Platform init start!");
+	int err = 0;
 
 	dev = alloc_etherdev_mq(sizeof(struct bpfnic_priv), MAX_QUEUES);
 	if (!dev) {
@@ -435,7 +435,6 @@ bpfnic_probe(struct platform_device *pdev)
 
 	err = register_netdev(dev);
 	if (err) {
-		pr_err("bpfnic: Failed to register netdev!");
 		goto err_free;
 	}
 
@@ -453,6 +452,12 @@ static int
 bpfnic_remove(struct platform_device *pdev)
 {
 	struct net_device *dev = platform_get_drvdata(pdev);
+	struct bpfnic_priv *priv = netdev_priv(dev);
+	struct net_device *peer = rtnl_dereference(priv->peer);
+
+	if (peer && priv->opened) {
+		netdev_rx_handler_unregister(peer);
+	}
 
 	if (dev) {
 		netif_tx_stop_all_queues(dev);
@@ -463,26 +468,42 @@ bpfnic_remove(struct platform_device *pdev)
 }
 
 
+/* Platform driver */
+
+static const struct of_device_id bpfnic_match[] = {
+	{ .compatible = "bpfnic,uml", },
+	{}
+};
+
 static struct platform_driver bpfnic_driver = {
+	.probe = bpfnic_probe,
 	.remove = bpfnic_remove,
 	.driver = {
-		.name = DRV_NAME,
+		.name = "bpfnic",
+		.of_match_table = bpfnic_match,
+		.owner	= THIS_MODULE,
 	},
 };
 
-/*
- * init/fini
- */
+MODULE_DEVICE_TABLE(of, bpfnic_match);
+
+static struct platform_device bpfnic = {
+	.name 		= "bpfnic",
+};
 
 static __init int bpfnic_init(void)
 {
 	int ret;  
-	pr_info("bpfnic: trying to register!"); 
-	ret = platform_driver_probe(&bpfnic_driver, bpfnic_probe);
+
+	ret = platform_driver_register(&bpfnic_driver);
 	if (ret)
 		pr_err("bpfnic: Error registering platform driver!");
-	else
-		pr_info("bpfnic: registered!");
+
+	if (ret) {
+		platform_driver_unregister(&bpfnic_driver);
+	} else {
+		platform_device_register(&bpfnic);
+	}
 
 	return ret;
 }
@@ -498,6 +519,6 @@ module_exit(bpfnic_exit);
 module_param(target_iface, charp, 0);
 MODULE_PARM_DESC(target_iface, "Target interface");
 
+MODULE_AUTHOR("Anton Ivanov <anton.ivanov@cambridgegreys.com>");
 MODULE_DESCRIPTION("Ethernet Leach");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS_RTNL_LINK(DRV_NAME);
+MODULE_LICENSE("GPL");
