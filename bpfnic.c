@@ -53,11 +53,15 @@ struct bpfnic_priv {
 	unsigned int		requested_headroom;
 	spinlock_t		lock;
 	bool			opened;
+	struct list_head list;
 };
 
 static int unit;
 
+static LIST_HEAD(bpfnic_devices);
+
 static char *target_iface = "";
+static char *peernames;
 
 /*
  * ethtool interface
@@ -188,7 +192,6 @@ static int bpfnic_open(struct net_device *dev)
 		goto done_open;
 	}
 
-	priv->dev = dev;
 	atomic64_set(&priv->dropped, 0);
 	atomic64_set(&priv->rx_packets, 0);
 	atomic64_set(&priv->rx_bytes, 0);
@@ -234,6 +237,9 @@ static int bpfnic_close(struct net_device *dev)
 
 	netif_tx_stop_all_queues(dev);
 	netif_carrier_off(dev);
+	if (peer && priv->opened) {
+		netdev_rx_handler_unregister(peer);
+	}
 	if (peer)
 		netif_carrier_off(peer);
 
@@ -245,17 +251,13 @@ static int bpfnic_dev_init(struct net_device *dev)
 	int err = 0;
 	struct bpfnic_priv *priv = netdev_priv(dev);
 
-	kernel_param_lock(THIS_MODULE);
 	snprintf(dev->name, sizeof(dev->name), "bpfnic%d", unit++);
 
 	priv->peer = NULL;
-	priv->peername = kstrdup(target_iface, GFP_KERNEL);
 	spin_lock_init(&priv->lock);
 
 	if (!priv->peername)
 		err = -ENOMEM;
-
-	kernel_param_unlock(THIS_MODULE);
 
 	rcu_read_lock();
 	priv->peer = dev_get_by_name_rcu(&init_net, priv->peername);
@@ -407,51 +409,87 @@ static void bpfnic_setup(struct net_device *dev)
 	dev->mpls_features = 0;
 }
 
-static int
-bpfnic_probe(struct platform_device *pdev)
+static void remove_all_ports(void)
+{
+	struct list_head *ele, *next;
+	struct bpfnic_priv *priv;
+
+	list_for_each_safe(ele, next, &bpfnic_devices) {
+		priv = list_entry(ele, struct bpfnic_priv, list);
+		if (priv->dev) {
+			netif_tx_stop_all_queues(priv->dev);
+			bpfnic_close(priv->dev);
+			unregister_netdev(priv->dev);
+		}
+	}
+}
+
+
+static int bpfnic_probe(struct platform_device *pdev)
 {
 	struct net_device *dev;
+	struct bpfnic_priv *priv;
 	int err = 0;
+	char *ifname; 
+	bool platform_init = true;
 
-	dev = alloc_etherdev_mq(sizeof(struct bpfnic_priv), MAX_QUEUES);
-	if (!dev) {
+	kernel_param_lock(THIS_MODULE);
+	peernames = kstrdup(target_iface, GFP_KERNEL);
+	kernel_param_unlock(THIS_MODULE);
+
+	if (!peernames) {
 		err = -ENOMEM;
-		goto err_out;
-	}
-
-	bpfnic_setup(dev);
-
-	err = register_netdev(dev);
-	if (err) {
 		goto err_free;
 	}
 
-	platform_set_drvdata(pdev, dev);
+	while (strlen(peernames) > 1) {
+
+		ifname = peernames;
+
+		while (strlen(peernames) > 1) {
+			peernames++;
+			if (peernames[0] == ',') {
+				peernames[0] = '\0';
+				peernames++;
+				break;
+			}
+		}
+
+		dev = alloc_etherdev_mq(sizeof(struct bpfnic_priv), MAX_QUEUES);
+		if (!dev) {
+			err = -ENOMEM;
+			goto err_free;
+		}
+
+		priv = netdev_priv(dev);
+		priv->peername = ifname;
+		priv->dev = dev;
+
+		bpfnic_setup(dev);
+
+		INIT_LIST_HEAD(&priv->list);
+		list_add_tail(&priv->list, &bpfnic_devices);
+
+		err = register_netdev(dev);
+		if (err) {
+			goto err_free;
+		}
+		if (platform_init) {
+			platform_set_drvdata(pdev, dev);
+			platform_init = false;
+		}
+	}
 	return 0;
 
 err_free:
-	free_netdev(dev);
-err_out:
+	remove_all_ports();
 	return err;
 }
-
 
 static int
 bpfnic_remove(struct platform_device *pdev)
 {
-	struct net_device *dev = platform_get_drvdata(pdev);
-	struct bpfnic_priv *priv = netdev_priv(dev);
-	struct net_device *peer = rtnl_dereference(priv->peer);
-
-	if (peer && priv->opened) {
-		netdev_rx_handler_unregister(peer);
-	}
-
-	if (dev) {
-		netif_tx_stop_all_queues(dev);
-		bpfnic_close(dev);
-		unregister_netdev(dev);
-	}
+	remove_all_ports();
 	return 0;
 }
 
