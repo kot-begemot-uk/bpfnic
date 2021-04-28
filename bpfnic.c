@@ -240,11 +240,6 @@ static int bpfnic_close(struct net_device *dev)
 	return 0;
 }
 
-static int is_valid_bpfnic_mtu(int mtu)
-{
-	return mtu >= ETH_MIN_MTU && mtu <= ETH_MAX_MTU;
-}
-
 static int bpfnic_dev_init(struct net_device *dev)
 {
 	int err = 0;
@@ -412,13 +407,6 @@ static void bpfnic_setup(struct net_device *dev)
 	dev->mpls_features = 0;
 }
 
-static struct net *bpfnic_get_link_net(const struct net_device *dev)
-{
-	struct bpfnic_priv *priv = netdev_priv(dev);
-	struct net_device *peer = rtnl_dereference(priv->peer);
-
-	return peer ? dev_net(peer) : dev_net(dev);
-}
 static int
 bpfnic_probe(struct platform_device *pdev)
 {
