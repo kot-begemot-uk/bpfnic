@@ -22,6 +22,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/filter.h>
 #include <linux/ptr_ring.h>
+#include <linux/bpf.h>
 #include <linux/bpf_trace.h>
 #include <linux/net_tstamp.h>
 
@@ -43,17 +44,24 @@ struct bpfnic_stats {
 	u64	rx_drops;
 };
 
+#define INGRESS_HOOK	0
+#define EGRESS_HOOK	1
+#define HOOKS_COUNT	2
+
 struct bpfnic_priv {
 	struct net_device __rcu	*peer;
 	struct net_device	*dev;
 	atomic64_t		rx_packets;
 	atomic64_t		rx_bytes;
 	atomic64_t		dropped;
+	/* bpf hooks */
+	struct			bpf_prog **bpf;
 	char 			*peername;	
 	unsigned int		requested_headroom;
 	spinlock_t		lock;
 	bool			opened;
 	struct list_head list;
+
 };
 
 static int unit;
@@ -84,6 +92,7 @@ static netdev_tx_t bpfnic_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
+	int bpf_ret = 1;
 
 	rcu_read_lock();
 	peer = rcu_dereference(priv->peer);
@@ -95,7 +104,10 @@ static netdev_tx_t bpfnic_xmit(struct sk_buff *skb, struct net_device *dev)
 		netif_trans_update(dev);
 		netif_wake_queue(dev);
 		skb->dev = peer;
-		if (is_skb_forwardable(skb->dev, skb)) {
+		if (priv->bpf[EGRESS_HOOK])
+			bpf_ret = bpf_prog_run_clear_cb(priv->bpf[EGRESS_HOOK], skb);
+
+		if ((bpf_ret > 0) && is_skb_forwardable(skb->dev, skb)) {
 			dev_lstats_add(dev, skb->len);
 			dev_queue_xmit(skb);
 		} else {
@@ -149,15 +161,19 @@ static rx_handler_result_t bpfnic_handle_frame(struct sk_buff **pskb)
 {
 	struct bpfnic_priv *priv;
 	struct sk_buff *skb = *pskb;
+	int bpf_ret = 1;
 
 	priv = bpfnic_peer_get_rcu(skb->dev);
 
+
 	/* bpf program invocation goes in here */
 
-	atomic64_inc(&priv->rx_packets);
-	atomic64_add(skb->len, &priv->rx_bytes);
+	if ((priv) && (priv->bpf[INGRESS_HOOK])) 
+		bpf_ret = bpf_prog_run_clear_cb(priv->bpf[INGRESS_HOOK], skb);
 
-	if (priv) {
+	if (priv && (bpf_ret > 0)) {
+		atomic64_inc(&priv->rx_packets);
+		atomic64_add(skb->len, &priv->rx_bytes);
 		skb->dev = priv->dev;
 		skb_forward_csum(skb);
 		if (is_multicast_ether_addr(eth_hdr(skb)->h_dest) ||
@@ -177,7 +193,7 @@ static int bpfnic_open(struct net_device *dev)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer = rtnl_dereference(priv->peer);
-	int ret = 0;
+	int i, ret = 0;
 
 	spin_lock(&priv->lock);
 	if (priv->opened) {
@@ -192,9 +208,22 @@ static int bpfnic_open(struct net_device *dev)
 		goto done_open;
 	}
 
+	priv->bpf = kmalloc(sizeof(struct bpf_prog *) * HOOKS_COUNT, GFP_KERNEL);
+
+	if (!priv->bpf) {
+		netdev_err(dev, "Cannot allocate BPF firmware hooks");
+		ret = -ENOMEM;
+		goto done_open;
+	}
+
+	for (i = 0; i < HOOKS_COUNT; i++) {
+		priv->bpf[i] = NULL;
+	}
+
 	atomic64_set(&priv->dropped, 0);
 	atomic64_set(&priv->rx_packets, 0);
 	atomic64_set(&priv->rx_bytes, 0);
+
 
 	netif_set_real_num_tx_queues(dev,
 			priv->peer->real_num_tx_queues);
@@ -242,6 +271,10 @@ static int bpfnic_close(struct net_device *dev)
 	}
 	if (peer)
 		netif_carrier_off(peer);
+	/* note - we do not deallocate bpf programs here as they may be
+	 * in use by more than one port
+	 */
+	kfree(priv->bpf);
 
 	return 0;
 }
