@@ -57,6 +57,8 @@ struct bpfnic_priv {
 	/* bpf hooks */
 	struct			bpf_prog **bpf;
 	char 			*peername;	
+	char			*ingress;
+	char			*egress;
 	unsigned int		requested_headroom;
 	spinlock_t		lock;
 	bool			opened;
@@ -69,6 +71,8 @@ static int unit;
 static LIST_HEAD(bpfnic_devices);
 
 static char *target_iface = "";
+static char *ingress = "";
+static char *egress = "";
 static char *peernames;
 
 /*
@@ -219,6 +223,28 @@ static int bpfnic_open(struct net_device *dev)
 	for (i = 0; i < HOOKS_COUNT; i++) {
 		priv->bpf[i] = NULL;
 	}
+	/*
+	 * temporary firmware load args
+	 */
+	if (priv->ingress != NULL) {
+		priv->bpf[INGRESS_HOOK] = bpf_prog_get_type_path(priv->ingress, BPF_PROG_TYPE_SOCKET_FILTER);
+		if (IS_ERR(priv->bpf[INGRESS_HOOK])){
+			priv->bpf[INGRESS_HOOK] = NULL;
+			netdev_err(dev, "Cannot access ingress hook %s", priv->ingress);
+		} else {
+			netdev_info(dev, "Configured ingress hook %s", priv->ingress);
+		}
+
+	}
+	if (priv->egress != NULL) {
+		priv->bpf[EGRESS_HOOK] = bpf_prog_get_type_path(priv->egress, BPF_PROG_TYPE_SOCKET_FILTER);
+		if (IS_ERR(priv->bpf[EGRESS_HOOK])){
+			priv->bpf[EGRESS_HOOK] = NULL;
+			netdev_err(dev, "Cannot access egress hook %s", priv->egress);
+		} else {
+			netdev_info(dev, "Configured egress hook %s", priv->egress);
+		}
+	}
 
 	atomic64_set(&priv->dropped, 0);
 	atomic64_set(&priv->rx_packets, 0);
@@ -255,6 +281,7 @@ static int bpfnic_open(struct net_device *dev)
 
 	spin_unlock(&priv->lock);
 
+	netdev_info(dev, "Configuration complete");
 done_open:
 	return ret;
 }
@@ -463,11 +490,13 @@ static int bpfnic_probe(struct platform_device *pdev)
 	struct net_device *dev;
 	struct bpfnic_priv *priv;
 	int err = 0;
-	char *ifname; 
+	char *ifname, *egress_path, *ingress_path;
 	bool platform_init = true;
 
 	kernel_param_lock(THIS_MODULE);
 	peernames = kstrdup(target_iface, GFP_KERNEL);
+	ingress_path = kstrdup(ingress, GFP_KERNEL);
+	egress_path = kstrdup(egress, GFP_KERNEL);
 	kernel_param_unlock(THIS_MODULE);
 
 	if (!peernames) {
@@ -497,6 +526,8 @@ static int bpfnic_probe(struct platform_device *pdev)
 		priv = netdev_priv(dev);
 		priv->peername = ifname;
 		priv->dev = dev;
+		priv->ingress = ingress_path;
+		priv->egress = egress_path;
 
 		bpfnic_setup(dev);
 
@@ -577,6 +608,12 @@ module_exit(bpfnic_exit);
 
 module_param(target_iface, charp, 0);
 MODULE_PARM_DESC(target_iface, "Target interface");
+
+module_param(ingress, charp, 0);
+MODULE_PARM_DESC(target_iface, "Ingress Hook");
+
+module_param(egress, charp, 0);
+MODULE_PARM_DESC(egress, "Egress hook");
 
 MODULE_AUTHOR("Anton Ivanov <anton.ivanov@cambridgegreys.com>");
 MODULE_DESCRIPTION("Ethernet Leach");
