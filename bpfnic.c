@@ -68,6 +68,8 @@ struct bpfnic_priv {
 
 static LIST_HEAD(bpfnic_devices);
 
+static DEFINE_SPINLOCK(bpfnic_devices_lock);
+
 static char *target_iface = "";
 static char *ingress = "";
 static char *egress = "";
@@ -83,6 +85,24 @@ struct bpfnic_shared {
 
 static struct bpfnic_shared *shared_info = NULL;
 static bool init_done = false;
+
+static struct bpfnic_priv *find_bpfnic_by_dev(struct net_device *dev)
+{
+	struct bpfnic_priv *device;
+	struct list_head *ele;
+
+	spin_lock(&bpfnic_devices_lock);
+	list_for_each(ele, &bpfnic_devices) {
+		device = list_entry(ele, struct bpfnic_priv, list);
+		if (device->dev == dev)
+			goto out;
+	}
+	device = NULL;
+ out:
+	spin_unlock(&bpfnic_devices_lock);
+	return device;
+}
+
 
 static int init_shared_info(void)
 {
@@ -308,6 +328,8 @@ static int bpfnic_close(struct net_device *dev)
 	int i;
 
 	spin_lock(&priv->lock);
+	if (priv->opened)
+		goto done_close;
 
 	netif_tx_stop_all_queues(dev);
 	netif_carrier_off(dev);
@@ -318,15 +340,18 @@ static int bpfnic_close(struct net_device *dev)
 				bpf_prog_sub(priv->bpf[i], 1);
 			}
 		}
+		kfree(priv->bpf);
+		priv->bpf = NULL;
 	}
 
 	/* note - we do not deallocate bpf programs here as they may be
 	 * in use by more than one port
 	 */
 
-	kfree(priv->bpf);
 
 	priv->opened = false;
+
+done_close:
 
 	spin_unlock(&priv->lock);
 
@@ -371,9 +396,7 @@ static int bpfnic_dev_init(struct net_device *dev)
 
 static void bpfnic_dev_free(struct net_device *dev)
 {
-	struct bpfnic_priv *priv = netdev_priv(dev);
-	if (priv->peer && priv->opened)
-		netdev_rx_handler_unregister(priv->peer);
+	bpfnic_close(dev);
 	free_percpu(dev->lstats);
 }
 
@@ -500,15 +523,13 @@ static void remove_all_ports(void)
 	struct bpfnic_priv *priv;
 	list_for_each_safe(ele, next, &bpfnic_devices) {
 		priv = list_entry(ele, struct bpfnic_priv, list);
-		if (priv->dev) {
-			if (priv->opened)
-				bpfnic_close(priv->dev);
-			rtnl_lock();
-			unregister_netdevice(priv->dev);
-			rtnl_unlock();
-		}
 		list_del(ele);
-		kfree(ele);
+		if (priv->opened)
+			bpfnic_close(priv->dev);
+		rtnl_lock();
+		unregister_netdevice(priv->dev);
+		free_netdev(priv->dev);
+		rtnl_unlock();
 	}
 }
 
@@ -562,7 +583,9 @@ static int bpfnic_probe(struct platform_device *pdev)
 		bpfnic_setup(dev);
 
 		INIT_LIST_HEAD(&priv->list);
+		spin_lock(&bpfnic_devices_lock);
 		list_add_tail(&priv->list, &bpfnic_devices);
+		spin_unlock(&bpfnic_devices_lock);
 
 		rtnl_lock();
 		err = register_netdevice(dev);
@@ -607,7 +630,7 @@ bpfnic_remove(struct platform_device *pdev)
 /* Platform driver */
 
 static const struct of_device_id bpfnic_match[] = {
-	{ .compatible = "bpfnic,uml", },
+	{ .compatible = "bpfnic", },
 	{}
 };
 
@@ -623,13 +646,12 @@ static struct platform_driver bpfnic_driver = {
 
 MODULE_DEVICE_TABLE(of, bpfnic_match);
 
-static struct platform_device bpfnic = {
-	.name 		= "bpfnic",
-};
+static struct platform_device *bpfnic;
 
 static __init int bpfnic_init(void)
 {
 	int ret;  
+
 
 	ret = init_shared_info();
 
@@ -638,22 +660,34 @@ static __init int bpfnic_init(void)
 
 	ret = platform_driver_register(&bpfnic_driver);
 
-	if (ret)
-		pr_err("bpfnic: Error registering platform driver!");
-
 	if (ret) {
-		platform_driver_unregister(&bpfnic_driver);
-	} else {
-		platform_device_register(&bpfnic);
-		init_done = true;
+		pr_err("bpfnic: Error registering platform driver!");
+		return ret;
 	}
 
+	bpfnic = platform_device_alloc("bpfnic", -1);
+
+	if (!bpfnic) {
+		ret = -ENOMEM;
+		goto fail_init;
+	} else {
+		ret = platform_device_add(bpfnic);
+		if (ret) {
+			platform_device_put(bpfnic);
+			goto fail_init;
+		}
+	}
+	init_done = true;
+	return 0;
+fail_init:
+	platform_driver_unregister(&bpfnic_driver);
 	return ret;
 }
 
 static __exit void bpfnic_exit(void)
 {
 	if (init_done) {
+		platform_device_del(bpfnic);
 		platform_driver_unregister(&bpfnic_driver);
 		init_done = false;
 	}
