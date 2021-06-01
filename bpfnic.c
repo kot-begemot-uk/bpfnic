@@ -16,6 +16,7 @@
 #include <linux/u64_stats_sync.h>
 #include <linux/platform_device.h>
 #include <net/dst.h>
+#include <net/switchdev.h>
 #include <net/xfrm.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
@@ -47,6 +48,13 @@ struct bpfnic_stats {
 #define EGRESS_HOOK	1
 #define HOOKS_COUNT	2
 
+struct bpfnic_info {
+	char *peername;
+	char **bpf_names;
+	int unit;
+};
+
+
 struct bpfnic_priv {
 	struct net_device __rcu	*peer;
 	struct net_device	*dev;
@@ -55,16 +63,12 @@ struct bpfnic_priv {
 	atomic64_t		dropped;
 	/* bpf hooks */
 	struct			bpf_prog **bpf;
-	char 			*peername;	
-	char			*ingress;
-	char			*egress;
-	unsigned int		requested_headroom;
+	struct bpfnic_info	*info;
 	spinlock_t		lock;
 	bool			opened;
 	struct list_head list;
 
 };
-
 
 static LIST_HEAD(bpfnic_devices);
 
@@ -74,16 +78,17 @@ static char *target_iface = "";
 static char *ingress = "";
 static char *egress = "";
 
-struct bpfnic_shared {
-	char *peernames;
-	char *default_ingress;
-	char *default_egress;
-	int unit;
+/*
+static char bpf_keys[] = {
+	{ "ingress" },
+	{ "egress" },
+	NULL
 };
+*/
 
 /* agrs and other information shared between all ports */
 
-static struct bpfnic_shared *shared_info = NULL;
+static struct bpfnic_info *default_bpfnic_info = NULL;
 static bool init_done = false;
 
 static struct bpfnic_priv *find_bpfnic_by_dev(struct net_device *dev)
@@ -104,18 +109,35 @@ static struct bpfnic_priv *find_bpfnic_by_dev(struct net_device *dev)
 }
 
 
-static int init_shared_info(void)
+static struct bpfnic_info *init_bpfnic_info(void)
 {
-	shared_info = kmalloc(sizeof(struct bpfnic_shared), GFP_KERNEL);
+	struct bpfnic_info *result;
 
-	if (!shared_info) 
-		return -ENOMEM;
+	result = kzalloc(sizeof(struct bpfnic_info), GFP_KERNEL);
 
-	shared_info->peernames = NULL;
-	shared_info->default_egress = NULL;
-	shared_info->default_ingress = NULL;
-	shared_info->unit = 0;
-	return 0;
+	if (!result) 
+		return NULL;
+
+	result->bpf_names = kzalloc(sizeof(char *) * HOOKS_COUNT, GFP_KERNEL);
+	if (!result->bpf_names) {
+		kfree(result);
+		return NULL;
+	}
+	return result;
+}
+
+static void destroy_bpfnic_info(struct bpfnic_info *arg)
+{
+	int i;
+	if (arg) {
+		if (arg->bpf_names) {
+			for (i = 0; i < HOOKS_COUNT; i++) {
+				kfree(arg->bpf_names[i]);
+			}
+			kfree(arg->bpf_names);
+		}
+		kfree(arg);
+	}
 }
 
 /*
@@ -255,7 +277,7 @@ static int bpfnic_open(struct net_device *dev)
 		goto done_open;
 	}
 
-	priv->bpf = kmalloc(sizeof(struct bpf_prog *) * HOOKS_COUNT, GFP_KERNEL);
+	priv->bpf = kzalloc(sizeof(struct bpf_prog *) * HOOKS_COUNT, GFP_KERNEL);
 
 	if (!priv->bpf) {
 		netdev_err(dev, "Cannot allocate BPF firmware hooks");
@@ -263,29 +285,17 @@ static int bpfnic_open(struct net_device *dev)
 		goto done_open;
 	}
 
-	for (i = 0; i < HOOKS_COUNT; i++) {
-		priv->bpf[i] = NULL;
-	}
-	/*
-	 * temporary firmware load args
-	 */
-	if (priv->ingress != NULL) {
-		priv->bpf[INGRESS_HOOK] = bpf_prog_get_type_path(priv->ingress, BPF_PROG_TYPE_SOCKET_FILTER);
-		if (IS_ERR(priv->bpf[INGRESS_HOOK])){
-			priv->bpf[INGRESS_HOOK] = NULL;
-			netdev_err(dev, "Cannot access ingress hook %s", priv->ingress);
-		} else {
-			netdev_info(dev, "Configured ingress hook %s", priv->ingress);
-		}
+	for (i = 0; i < HOOKS_COUNT; i++) { 
+		if (priv->info->bpf_names[i]) {
+			priv->bpf[i] =
+				bpf_prog_get_type_path(priv->info->bpf_names[i], BPF_PROG_TYPE_SOCKET_FILTER);
+			if (IS_ERR(priv->bpf[i])){
+				priv->bpf[i] = NULL;
+				netdev_err(dev, "Cannot configure %s hook", priv->info->bpf_names[i]);
+			} else {
+				netdev_info(dev, "Configured %s hook", priv->info->bpf_names[i]);
+			}
 
-	}
-	if (priv->egress != NULL) {
-		priv->bpf[EGRESS_HOOK] = bpf_prog_get_type_path(priv->egress, BPF_PROG_TYPE_SOCKET_FILTER);
-		if (IS_ERR(priv->bpf[EGRESS_HOOK])){
-			priv->bpf[EGRESS_HOOK] = NULL;
-			netdev_err(dev, "Cannot access egress hook %s", priv->egress);
-		} else {
-			netdev_info(dev, "Configured egress hook %s", priv->egress);
 		}
 	}
 
@@ -341,7 +351,6 @@ static int bpfnic_close(struct net_device *dev)
 			}
 		}
 		kfree(priv->bpf);
-		priv->bpf = NULL;
 	}
 
 	/* note - we do not deallocate bpf programs here as they may be
@@ -363,16 +372,16 @@ static int bpfnic_dev_init(struct net_device *dev)
 	int err = 0;
 	struct bpfnic_priv *priv = netdev_priv(dev);
 
-	snprintf(dev->name, sizeof(dev->name), "bpfnic%d", shared_info->unit++);
+	snprintf(dev->name, sizeof(dev->name), "bpfnic%d", default_bpfnic_info->unit++);
 
 	priv->peer = NULL;
 	spin_lock_init(&priv->lock);
 
-	if (!priv->peername)
+	if (!priv->info->peername)
 		err = -ENOMEM;
 
 	rcu_read_lock();
-	priv->peer = dev_get_by_name_rcu(&init_net, priv->peername);
+	priv->peer = dev_get_by_name_rcu(&init_net, priv->info->peername);
 	rcu_read_unlock();
 
 	if (!priv->peer)
@@ -430,7 +439,7 @@ static int bpfnic_get_iflink(const struct net_device *dev)
 
 static void bpfnic_set_rx_headroom(struct net_device *dev, int new_hr)
 {
-	struct bpfnic_priv *peer_priv, *priv = netdev_priv(dev);
+	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
 
 	if (new_hr < 0)
@@ -440,13 +449,8 @@ static void bpfnic_set_rx_headroom(struct net_device *dev, int new_hr)
 	peer = rcu_dereference(priv->peer);
 	if (unlikely(!peer))
 		goto out;
-
-	peer_priv = netdev_priv(peer);
-	priv->requested_headroom = new_hr;
-	new_hr = max(priv->requested_headroom, peer_priv->requested_headroom);
-	dev->needed_headroom = new_hr;
-	peer->needed_headroom = new_hr;
-
+	if (peer->netdev_ops->ndo_set_rx_headroom) 
+		peer->netdev_ops->ndo_set_rx_headroom(peer, new_hr);
 out:
 	rcu_read_unlock();
 }
@@ -527,28 +531,91 @@ static void remove_all_ports(void)
 		if (priv->opened)
 			bpfnic_close(priv->dev);
 		rtnl_lock();
+		destroy_bpfnic_info(priv->info);
 		unregister_netdevice(priv->dev);
 		free_netdev(priv->dev);
 		rtnl_unlock();
 	}
 }
 
+static int bpfnic_switchdev_event(struct notifier_block *unused,
+				  unsigned long event, void *ptr)
+{
+	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+	struct switchdev_notifier_fdb_info *fdb_info = ptr;
+	struct bpfnic_priv *priv;
+
+	netdev_info(dev, "fdb info %s", dev->name);  
+	if (!find_bpfnic_by_dev(dev))
+		return NOTIFY_DONE;
+/*
+	if (event == SWITCHDEV_PORT_ATTR_SET)
+		return rocker_switchdev_port_attr_set_event(dev, ptr);
+*/
+
+	priv = netdev_priv(dev);
+
+	switch (event) {
+	case SWITCHDEV_FDB_ADD_TO_DEVICE:
+		netdev_info(dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
+				fdb_info->addr[0],
+				fdb_info->addr[1],
+				fdb_info->addr[2],
+				fdb_info->addr[3],
+				fdb_info->addr[4],
+				fdb_info->addr[5]);  
+		break;
+	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+		netdev_info(dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
+				fdb_info->addr[0],
+				fdb_info->addr[1],
+				fdb_info->addr[2],
+				fdb_info->addr[3],
+				fdb_info->addr[4],
+				fdb_info->addr[5]);  
+/*
+   rocker_fdb_offload_notify(rocker_port, fdb_info);
+*/
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
+
+/*
+	queue_work(rocker_port->rocker->rocker_owq,
+		   &switchdev_work->work);
+*/
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block bpfnic_switchdev_notifier = {
+	.notifier_call = bpfnic_switchdev_event,
+};
 
 static int bpfnic_probe(struct platform_device *pdev)
 {
 	struct net_device *dev;
 	struct bpfnic_priv *priv;
-	int err = 0;
+	int err = 0, i;
 	char *ifname, *peernames;
 	bool platform_init = true;
 
+	default_bpfnic_info = init_bpfnic_info();
+	if (!default_bpfnic_info)
+		goto err_free;
+
 	kernel_param_lock(THIS_MODULE);
-	shared_info->peernames = kstrdup(target_iface, GFP_KERNEL);
-	shared_info->default_ingress = kstrdup(ingress, GFP_KERNEL);
-	shared_info->default_egress = kstrdup(egress, GFP_KERNEL);
+	default_bpfnic_info->peername = kstrdup(target_iface, GFP_KERNEL);
+	default_bpfnic_info->bpf_names[INGRESS_HOOK] = kstrdup(ingress, GFP_KERNEL);
+	default_bpfnic_info->bpf_names[EGRESS_HOOK] = kstrdup(egress, GFP_KERNEL);
 	kernel_param_unlock(THIS_MODULE);
 
-	peernames = shared_info->peernames;
+	if ((!default_bpfnic_info->peername) ||
+		(!default_bpfnic_info->bpf_names[INGRESS_HOOK]) ||
+		(!default_bpfnic_info->bpf_names[EGRESS_HOOK]))
+		goto err_free;
+
+	peernames = default_bpfnic_info->peername;
 
 	if (!peernames) {
 		err = -ENOMEM;
@@ -575,10 +642,15 @@ static int bpfnic_probe(struct platform_device *pdev)
 		}
 
 		priv = netdev_priv(dev);
-		priv->peername = ifname;
+		priv->info = init_bpfnic_info();
+		if (!priv->info)
+			goto err_free;
+		priv->info->peername = ifname;
 		priv->dev = dev;
-		priv->ingress = shared_info->default_ingress;
-		priv->egress = shared_info->default_egress;
+		for (i = 0; i < HOOKS_COUNT; i++) {
+			priv->info->bpf_names[i] =
+				kstrdup(default_bpfnic_info->bpf_names[i], GFP_KERNEL);
+		}
 
 		bpfnic_setup(dev);
 
@@ -599,6 +671,12 @@ static int bpfnic_probe(struct platform_device *pdev)
 			platform_init = false;
 		}
 	}
+	err = register_switchdev_notifier(&bpfnic_switchdev_notifier);
+	if (err) {
+		printk(KERN_ERR "bpfnic - failed to register switchdev notifier\n");
+		goto err_free;
+	}
+	
 	return 0;
 
 err_free:
@@ -613,13 +691,10 @@ bpfnic_remove(struct platform_device *pdev)
 	if (init_done) {
 		remove_all_ports();
 
-		if (shared_info) {
-			kfree(shared_info->peernames);
-			kfree(shared_info->default_ingress);
-			kfree(shared_info->default_egress);
-			kfree(shared_info);
-		}
-		shared_info = NULL;
+		if (default_bpfnic_info)
+			destroy_bpfnic_info(default_bpfnic_info);
+
+		default_bpfnic_info = NULL;
 		init_done = false;
 
 	} else
@@ -652,12 +727,6 @@ static __init int bpfnic_init(void)
 {
 	int ret;  
 
-
-	ret = init_shared_info();
-
-	if (ret)
-		return ret;
-
 	ret = platform_driver_register(&bpfnic_driver);
 
 	if (ret) {
@@ -689,6 +758,7 @@ static __exit void bpfnic_exit(void)
 	if (init_done) {
 		platform_device_del(bpfnic);
 		platform_driver_unregister(&bpfnic_driver);
+		unregister_switchdev_notifier(&bpfnic_switchdev_notifier);
 		init_done = false;
 	}
 }
