@@ -26,6 +26,7 @@
 #include <linux/bpf_trace.h>
 #include <linux/ctype.h>
 #include <linux/net_tstamp.h>
+#include "bpfnic_shared.h"
 
 #define DRV_NAME	"bpfnic"
 #define DRV_VERSION	"0.1"
@@ -47,9 +48,10 @@ struct bpfnic_stats {
 
 #define INGRESS_HOOK	0
 #define EGRESS_HOOK	1
-#define FDB_HOOK	2
-#define FIB_HOOK	3
-#define HOOKS_COUNT	4
+#define FDB_ADD_HOOK	2
+#define FDB_DEL_HOOK	3
+#define FIB_HOOK	4
+#define HOOKS_COUNT	5
 
 struct bpfnic_info {
 	char *peername;
@@ -82,10 +84,13 @@ static char *target_iface = "";
 static char *ingress = "";
 static char *egress = "";
 
+static struct workqueue_struct *bpfnic_workq;
+
 static char* prog_names[] = {
 	"ingress",
 	"egress",
-	"fdb",
+	"fdb_add",
+	"fdb_del",
 	"fib",
 	NULL
 };
@@ -141,8 +146,6 @@ static int reload_bpf(struct net_device *dev, int index)
 
 	wmb();
 
-	netdev_info(dev, "Returning %d\n", ret);
-
 	return ret;
 }
 
@@ -163,6 +166,10 @@ static int set_bpf_name(struct bpfnic_priv *priv, const char *buf, size_t len, i
 			if (!old)
 				return -ENOMEM;
 		} 
+	} else {
+		priv->info->bpf_names[index] = kmalloc(len + 1, GFP_ATOMIC);
+		if (!priv->info->bpf_names[index])
+			return -ENOMEM;
 	}
 	strncpy(priv->info->bpf_names[index], buf, len);
 	term_nl = priv->info->bpf_names[index];
@@ -220,23 +227,41 @@ static ssize_t egress_hook_store(struct device *d,
 
 static DEVICE_ATTR_RW(egress_hook);
 
-static ssize_t fdb_hook_show(struct device *d,
+static ssize_t fdb_add_hook_show(struct device *d,
 				 struct device_attribute *attr,
 				 char *buf)
 {
 	struct bpfnic_priv *priv = to_bpfnic(d);
-	return sprintf(buf, "%s\n", priv->info->bpf_names[FDB_HOOK]);
+	return sprintf(buf, "%s\n", priv->info->bpf_names[FDB_ADD_HOOK]);
 }
 
-static ssize_t fdb_hook_store(struct device *d,
+static ssize_t fdb_add_hook_store(struct device *d,
 				  struct device_attribute *attr,
 				  const char *buf, size_t len)
 {
 	struct bpfnic_priv *priv = to_bpfnic(d);
-	return set_bpf_name(priv, buf, len, FDB_HOOK);
+	return set_bpf_name(priv, buf, len, FDB_ADD_HOOK);
 }
 
-static DEVICE_ATTR_RW(fdb_hook);
+static DEVICE_ATTR_RW(fdb_add_hook);
+
+static ssize_t fdb_del_hook_show(struct device *d,
+				 struct device_attribute *attr,
+				 char *buf)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	return sprintf(buf, "%s\n", priv->info->bpf_names[FDB_ADD_HOOK]);
+}
+
+static ssize_t fdb_del_hook_store(struct device *d,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	return set_bpf_name(priv, buf, len, FDB_ADD_HOOK);
+}
+
+static DEVICE_ATTR_RW(fdb_del_hook);
 
 static ssize_t fib_hook_show(struct device *d,
 				 struct device_attribute *attr,
@@ -260,7 +285,8 @@ static DEVICE_ATTR_RW(fib_hook);
 static struct attribute *bpfnic_attrs[] = {
 	&dev_attr_ingress_hook.attr,
 	&dev_attr_egress_hook.attr,
-	&dev_attr_fdb_hook.attr,
+	&dev_attr_fdb_add_hook.attr,
+	&dev_attr_fdb_del_hook.attr,
 	&dev_attr_fib_hook.attr,
 	NULL
 };
@@ -304,9 +330,97 @@ static void destroy_bpfnic_info(struct bpfnic_info *arg)
 }
 
 /*
- * ethtool interface
+ * Switchdev interface
  */
 
+
+struct bpfnic_switchdev_event_work {
+	struct work_struct work;
+	struct switchdev_notifier_fdb_info fdb_info;
+	struct bpfnic_priv *priv;
+	unsigned long event;
+};
+
+
+static void
+bpfnic_fdb_offload_notify(struct bpfnic_priv *priv,
+			  struct switchdev_notifier_fdb_info *recv_info)
+{
+	struct switchdev_notifier_fdb_info info;
+
+	info.addr = recv_info->addr;
+	info.vid = recv_info->vid;
+	info.offloaded = true;
+	call_switchdev_notifiers(SWITCHDEV_FDB_OFFLOADED,
+				 priv->dev, &info.info, NULL);
+}
+
+static void build_switchdev_context(struct bpfnic_notify_context *context,
+		               struct switchdev_notifier_fdb_info *fdb_info)
+{
+	context->ifindex = fdb_info->info.dev->ifindex;
+	ether_addr_copy((u8 *) &context->addr, fdb_info->addr);
+	context->vid = fdb_info->vid;
+	context->added_by_user = fdb_info->added_by_user;
+	context->offloaded = fdb_info->offloaded;
+}
+
+static void bpfnic_switchdev_handle_work(struct work_struct *work)
+{
+	struct bpfnic_switchdev_event_work *switchdev_work =
+		container_of(work, struct bpfnic_switchdev_event_work, work);
+	struct bpfnic_priv *priv = switchdev_work->priv;
+	struct switchdev_notifier_fdb_info *fdb_info;
+	struct bpfnic_notify_context context;
+
+	printk(KERN_INFO "Started delayed work %p", priv);
+
+	rtnl_lock();
+
+	switch (switchdev_work->event) {
+	case SWITCHDEV_FDB_ADD_TO_DEVICE:
+		fdb_info = &switchdev_work->fdb_info;
+		build_switchdev_context(&context, fdb_info);
+		printk(KERN_INFO "Built context %p, %p", fdb_info, fdb_info->addr);
+		netdev_info(priv->dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
+				context.addr[0],
+				context.addr[1],
+				context.addr[2],
+				context.addr[3],
+				context.addr[4],
+				context.addr[5]);  
+		if (priv->bpf[FDB_ADD_HOOK]) {
+			if (BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context)) {
+				netdev_info(priv->dev, "fdb add failed");
+			} else {
+				bpfnic_fdb_offload_notify(priv, fdb_info);
+			}
+
+		}
+		break;
+	case SWITCHDEV_FDB_DEL_TO_DEVICE:
+		fdb_info = &switchdev_work->fdb_info;
+		build_switchdev_context(&context, fdb_info);
+		printk(KERN_INFO "Built context");
+		netdev_info(priv->dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
+				context.addr[0],
+				context.addr[1],
+				context.addr[2],
+				context.addr[3],
+				context.addr[4],
+				context.addr[5]);  
+		if (priv->bpf[FDB_DEL_HOOK]) {
+			if(BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context))
+				netdev_info(priv->dev, "fdb del failed");
+		}
+		break;
+	};
+	rtnl_unlock();
+	printk(KERN_INFO "Finished work");
+	kfree(switchdev_work->fdb_info.addr);
+	kfree(switchdev_work);
+	dev_put(priv->dev);
+}
 
 static void bpfnic_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info)
 {
@@ -337,7 +451,7 @@ static netdev_tx_t bpfnic_xmit(struct sk_buff *skb, struct net_device *dev)
 		netif_wake_queue(dev);
 		skb->dev = peer;
 		if (priv->bpf[EGRESS_HOOK]) {
-			bpf_ret = bpf_prog_run_clear_cb(priv->bpf[EGRESS_HOOK], skb);
+			bpf_ret = BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], skb);
 		}
 
 		if ((bpf_ret > 0) && is_skb_forwardable(skb->dev, skb)) {
@@ -406,7 +520,7 @@ static rx_handler_result_t bpfnic_handle_frame(struct sk_buff **pskb)
 	/* bpf program invocation goes in here */
 
 	if ((priv) && (priv->bpf[INGRESS_HOOK])) 
-		bpf_ret = bpf_prog_run_clear_cb(priv->bpf[INGRESS_HOOK], skb);
+		bpf_ret = BPF_PROG_RUN(priv->bpf[INGRESS_HOOK], skb);
 
 	if (priv && (bpf_ret > 0)) {
 		atomic64_inc(&priv->rx_packets);
@@ -473,6 +587,7 @@ static int bpfnic_open(struct net_device *dev)
 	dev->hw_features = priv->peer->hw_features;
 	dev->hw_enc_features = priv->peer->hw_enc_features;
 	dev->mpls_features = priv->peer->mpls_features;
+	dev->wanted_features = priv->peer->wanted_features;
 
 	if (!ret) {
 		priv->opened = true;
@@ -620,25 +735,56 @@ static int bpfnic_set_features(struct net_device *dev,
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
-	int ret = 0;
 
 	peer = rcu_dereference(priv->peer);
 	if (peer) {
-		ret = peer->netdev_ops->ndo_set_features(dev, features);
+		peer->wanted_features = features;
+		netdev_update_features(peer);
 		dev->features = peer->features;
 	}
-	return ret;
+	return 0;
 }
+
 static netdev_features_t bpfnic_fix_features(struct net_device *dev,
 	netdev_features_t features)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
-	netdev_features_t ret = 0;
 
 	peer = rcu_dereference(priv->peer);
 	if (peer) {
-		ret = peer->netdev_ops->ndo_set_features(dev, features);
+		if (peer->netdev_ops->ndo_fix_features)
+			features = peer->netdev_ops->ndo_fix_features(dev, features);
+	}
+	return features;
+}
+
+static int bpfnic_vlan_rx_add_vid(struct net_device *dev,
+						       __be16 proto, u16 vid)
+{
+	struct bpfnic_priv *priv = netdev_priv(dev);
+	struct net_device *peer;
+	int ret = -EINVAL;
+
+	peer = rcu_dereference(priv->peer);
+	if (peer) {
+		if (peer->netdev_ops->ndo_vlan_rx_add_vid)
+			ret = peer->netdev_ops->ndo_vlan_rx_add_vid(peer, proto, vid);
+	}
+	return ret;
+}
+
+static int bpfnic_vlan_rx_kill_vid(struct net_device *dev,
+						       __be16 proto, u16 vid)
+{
+	struct bpfnic_priv *priv = netdev_priv(dev);
+	struct net_device *peer;
+	int ret = -EINVAL;
+
+	peer = rcu_dereference(priv->peer);
+	if (peer) {
+		if (peer->netdev_ops->ndo_vlan_rx_kill_vid)
+			ret = peer->netdev_ops->ndo_vlan_rx_kill_vid(peer, proto, vid);
 	}
 	return ret;
 }
@@ -662,12 +808,16 @@ static const struct net_device_ops bpfnic_netdev_ops = {
 	.ndo_features_check	= passthru_features_check,
 	.ndo_set_rx_headroom	= bpfnic_set_rx_headroom,
 	.ndo_get_peer_dev	= bpfnic_peer_dev,
+	.ndo_vlan_rx_add_vid	= bpfnic_vlan_rx_add_vid,
+	.ndo_vlan_rx_kill_vid 	= bpfnic_vlan_rx_kill_vid,
 };
 
 static void bpfnic_setup(struct net_device *dev)
 {
-	ether_setup(dev);
 
+	ether_setup(dev);
+	rcu_read_lock();
+	rcu_read_unlock();
 	
 	dev->netdev_ops = &bpfnic_netdev_ops;
 	dev->ethtool_ops = &bpfnic_ethtool_ops;
@@ -704,49 +854,46 @@ static int bpfnic_switchdev_event(struct notifier_block *unused,
 {
 	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
 	struct switchdev_notifier_fdb_info *fdb_info = ptr;
+	struct bpfnic_switchdev_event_work *switchdev_work;
 	struct bpfnic_priv *priv;
 
-	netdev_info(dev, "fdb info %s", dev->name);  
-	if (!find_bpfnic_by_dev(dev))
+	priv = find_bpfnic_by_dev(dev);
+	if (!priv)
 		return NOTIFY_DONE;
-/*
-	if (event == SWITCHDEV_PORT_ATTR_SET)
-		return rocker_switchdev_port_attr_set_event(dev, ptr);
-*/
 
-	priv = netdev_priv(dev);
+	switchdev_work = kzalloc(sizeof(*switchdev_work), GFP_ATOMIC);
+	if (WARN_ON(!switchdev_work))
+		return NOTIFY_BAD;
+
+	INIT_WORK(&switchdev_work->work, bpfnic_switchdev_handle_work);
+	switchdev_work->priv = priv;
+	switchdev_work->event = event;
 
 	switch (event) {
 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
-		netdev_info(dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
-				fdb_info->addr[0],
-				fdb_info->addr[1],
-				fdb_info->addr[2],
-				fdb_info->addr[3],
-				fdb_info->addr[4],
-				fdb_info->addr[5]);  
-		break;
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
-		netdev_info(dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
-				fdb_info->addr[0],
-				fdb_info->addr[1],
-				fdb_info->addr[2],
-				fdb_info->addr[3],
-				fdb_info->addr[4],
-				fdb_info->addr[5]);  
-/*
-   rocker_fdb_offload_notify(rocker_port, fdb_info);
-*/
+		memcpy(&switchdev_work->fdb_info, ptr,
+		       sizeof(switchdev_work->fdb_info));
+		switchdev_work->fdb_info.addr = kzalloc(ETH_ALEN, GFP_ATOMIC);
+		if (unlikely(!switchdev_work->fdb_info.addr)) {
+			kfree(switchdev_work);
+			return NOTIFY_BAD;
+		}
+
+		ether_addr_copy((u8 *)switchdev_work->fdb_info.addr,
+				fdb_info->addr);
+		/* Take a reference on the rocker device */
+		dev_hold(dev);
 		break;
 	default:
+		kfree(switchdev_work);
 		return NOTIFY_DONE;
 	}
 
-/*
-	queue_work(rocker_port->rocker->rocker_owq,
-		   &switchdev_work->work);
-*/
+	queue_work(bpfnic_workq, &switchdev_work->work);
 	return NOTIFY_DONE;
+
+	
 }
 
 static struct notifier_block bpfnic_switchdev_notifier = {
@@ -765,6 +912,13 @@ static int bpfnic_probe(struct platform_device *pdev)
 	default_bpfnic_info = init_bpfnic_info();
 	if (!default_bpfnic_info)
 		goto err_free;
+
+	bpfnic_workq = alloc_ordered_workqueue(DRV_NAME, WQ_MEM_RECLAIM);
+
+	if (!bpfnic_workq) {
+		err = -ENOMEM;
+		goto err_free;
+	}
 
 	kernel_param_lock(THIS_MODULE);
 	default_bpfnic_info->peername = kstrdup(target_iface, GFP_KERNEL);
