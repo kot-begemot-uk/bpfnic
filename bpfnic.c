@@ -50,8 +50,7 @@ struct bpfnic_stats {
 #define EGRESS_HOOK	1
 #define FDB_ADD_HOOK	2
 #define FDB_DEL_HOOK	3
-#define FIB_HOOK	4
-#define HOOKS_COUNT	5
+#define HOOKS_COUNT	4
 
 struct bpfnic_info {
 	char *peername;
@@ -91,7 +90,6 @@ static char* prog_names[] = {
 	"egress",
 	"fdb_add",
 	"fdb_del",
-	"fib",
 	NULL
 };
 
@@ -263,31 +261,11 @@ static ssize_t fdb_del_hook_store(struct device *d,
 
 static DEVICE_ATTR_RW(fdb_del_hook);
 
-static ssize_t fib_hook_show(struct device *d,
-				 struct device_attribute *attr,
-				 char *buf)
-{
-	struct bpfnic_priv *priv = to_bpfnic(d);
-	return sprintf(buf, "%s\n", priv->info->bpf_names[FIB_HOOK]);
-}
-
-static ssize_t fib_hook_store(struct device *d,
-				  struct device_attribute *attr,
-				  const char *buf, size_t len)
-{
-	struct bpfnic_priv *priv = to_bpfnic(d);
-	return set_bpf_name(priv, buf, len, FIB_HOOK);
-}
-
-static DEVICE_ATTR_RW(fib_hook);
-
-
 static struct attribute *bpfnic_attrs[] = {
 	&dev_attr_ingress_hook.attr,
 	&dev_attr_egress_hook.attr,
 	&dev_attr_fdb_add_hook.attr,
 	&dev_attr_fdb_del_hook.attr,
-	&dev_attr_fib_hook.attr,
 	NULL
 };
 
@@ -373,16 +351,13 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 	struct switchdev_notifier_fdb_info *fdb_info;
 	struct bpfnic_notify_context context;
 
-	printk(KERN_INFO "Started delayed work %p", priv);
-
 	rtnl_lock();
 
 	switch (switchdev_work->event) {
 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
 		fdb_info = &switchdev_work->fdb_info;
 		build_switchdev_context(&context, fdb_info);
-		printk(KERN_INFO "Built context %p, %p", fdb_info, fdb_info->addr);
-		netdev_info(priv->dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
+		netdev_debug(priv->dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
 				context.addr[0],
 				context.addr[1],
 				context.addr[2],
@@ -390,8 +365,8 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 				context.addr[4],
 				context.addr[5]);  
 		if (priv->bpf[FDB_ADD_HOOK]) {
-			if (BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context)) {
-				netdev_info(priv->dev, "fdb add failed");
+			if (!BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context)) {
+				netdev_err(priv->dev, "fdb add failed");
 			} else {
 				bpfnic_fdb_offload_notify(priv, fdb_info);
 			}
@@ -401,8 +376,7 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
 		fdb_info = &switchdev_work->fdb_info;
 		build_switchdev_context(&context, fdb_info);
-		printk(KERN_INFO "Built context");
-		netdev_info(priv->dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
+		netdev_debug(priv->dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
 				context.addr[0],
 				context.addr[1],
 				context.addr[2],
@@ -410,13 +384,12 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 				context.addr[4],
 				context.addr[5]);  
 		if (priv->bpf[FDB_DEL_HOOK]) {
-			if(BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context))
+			if(!BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context))
 				netdev_info(priv->dev, "fdb del failed");
 		}
 		break;
 	};
 	rtnl_unlock();
-	printk(KERN_INFO "Finished work");
 	kfree(switchdev_work->fdb_info.addr);
 	kfree(switchdev_work);
 	dev_put(priv->dev);
@@ -596,7 +569,6 @@ static int bpfnic_open(struct net_device *dev)
 
 	spin_unlock(&priv->lock);
 
-	netdev_info(dev, "Configuration complete");
 done_open:
 	return ret;
 }
