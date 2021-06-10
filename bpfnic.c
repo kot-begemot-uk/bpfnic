@@ -357,7 +357,7 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
 		fdb_info = &switchdev_work->fdb_info;
 		build_switchdev_context(&context, fdb_info);
-		netdev_debug(priv->dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
+		netdev_dbg(priv->dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
 				context.addr[0],
 				context.addr[1],
 				context.addr[2],
@@ -376,7 +376,7 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
 		fdb_info = &switchdev_work->fdb_info;
 		build_switchdev_context(&context, fdb_info);
-		netdev_debug(priv->dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
+		netdev_dbg(priv->dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
 				context.addr[0],
 				context.addr[1],
 				context.addr[2],
