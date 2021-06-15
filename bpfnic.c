@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+
 /*
  *  drivers/net/bpfnic.c
  *
@@ -71,6 +72,7 @@ struct bpfnic_priv {
 	spinlock_t		lock;
 	bool			opened;
 	bool			running;
+	bool			registered;
 	struct list_head list;
 
 };
@@ -78,10 +80,6 @@ struct bpfnic_priv {
 static LIST_HEAD(bpfnic_devices);
 
 static DEFINE_SPINLOCK(bpfnic_devices_lock);
-
-static char *target_iface = "";
-static char *ingress = "";
-static char *egress = "";
 
 static struct workqueue_struct *bpfnic_workq;
 
@@ -116,6 +114,7 @@ static struct bpfnic_priv *find_bpfnic_by_dev(struct net_device *dev)
 }
 
 #define to_bpfnic(cd)	((struct bpfnic_priv *)netdev_priv(to_net_dev(cd)))
+#define to_maindev(cd)	(to_platform_device(cd))
 
 static int reload_bpf(struct net_device *dev, int index)
 {
@@ -189,6 +188,9 @@ static int set_bpf_name(struct bpfnic_priv *priv, const char *buf, size_t len, i
 	return len;
 }
 
+
+/* per port sysfs interface */
+
 static ssize_t ingress_hook_show(struct device *d,
 				 struct device_attribute *attr,
 				 char *buf)
@@ -261,11 +263,63 @@ static ssize_t fdb_del_hook_store(struct device *d,
 
 static DEVICE_ATTR_RW(fdb_del_hook);
 
+static ssize_t peer_show(struct device *d,
+				 struct device_attribute *attr,
+				 char *buf)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	return sprintf(buf, "%s\n", priv->info->peername);
+}
+
+static ssize_t peer_store(struct device *d,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	int pos = 0, err = len;
+	char *term_nl, *result; 
+	
+	spin_lock(&priv->lock);
+	if (priv->opened) {
+		err = -EBUSY;
+		goto done;
+	}
+	
+	term_nl = kstrdup(buf, GFP_ATOMIC);
+	if (!term_nl) {
+		err = -ENOMEM;
+		goto done;
+	}
+	result = term_nl;
+
+	while (*term_nl != '\0' && pos < len) {
+		if (isspace(*term_nl) || (*term_nl == '\n')) {
+			*term_nl = '\0';
+			break;
+		}
+		term_nl++;
+		pos++;
+	}
+
+	if (strlen(result) > 0) {
+		priv->info->peername = result;
+	}
+	else
+		err =  -EINVAL;
+
+	spin_unlock(&priv->lock);
+done:
+	return err;
+}
+
+static DEVICE_ATTR_RW(peer);
+
 static struct attribute *bpfnic_attrs[] = {
 	&dev_attr_ingress_hook.attr,
 	&dev_attr_egress_hook.attr,
 	&dev_attr_fdb_add_hook.attr,
 	&dev_attr_fdb_del_hook.attr,
+	&dev_attr_peer.attr,
 	NULL
 };
 
@@ -525,12 +579,24 @@ static int bpfnic_open(struct net_device *dev)
 		goto done_open;
 	}
 
+	if (!priv->info->peername) {
+		netdev_err(dev, "No peer available");
+		ret = -ENXIO;
+		goto done_open;
+	}
+
+	
+	rcu_read_lock();
+	priv->peer = dev_get_by_name_rcu(&init_net, priv->info->peername);
+	rcu_read_unlock();
+
 	if (!priv->peer) {
 		netdev_err(dev, "Cannot deref peer");
 		ret = -ENOTCONN;
 		goto done_open;
 	}
 
+	eth_hw_addr_inherit(dev, priv->peer);
 
 	for (i = 0; i < HOOKS_COUNT; i++) { 
 		if (priv->info->bpf_names[i]) {
@@ -618,20 +684,7 @@ static int bpfnic_dev_init(struct net_device *dev)
 	priv->peer = NULL;
 	spin_lock_init(&priv->lock);
 
-	if (!priv->info->peername)
-		err = -ENOMEM;
-
-	rcu_read_lock();
-	priv->peer = dev_get_by_name_rcu(&init_net, priv->info->peername);
-	rcu_read_unlock();
-
-	if (!priv->peer)
-		err = -EINVAL;
-
-	if (priv->peer)
-		eth_hw_addr_inherit(dev, priv->peer);
-	else 
-		eth_hw_addr_random(dev);
+	eth_hw_addr_random(dev);
 
 	priv->opened = false;
 
@@ -788,8 +841,6 @@ static void bpfnic_setup(struct net_device *dev)
 {
 
 	ether_setup(dev);
-	rcu_read_lock();
-	rcu_read_unlock();
 	
 	dev->netdev_ops = &bpfnic_netdev_ops;
 	dev->ethtool_ops = &bpfnic_ethtool_ops;
@@ -803,6 +854,18 @@ static void bpfnic_setup(struct net_device *dev)
 	dev->hw_enc_features = 0;
 	dev->mpls_features = 0;
 }
+static void remove_one_port(struct bpfnic_priv *priv)
+{
+	if (priv->opened)
+		bpfnic_close(priv->dev);
+	rtnl_lock();
+	destroy_bpfnic_info(priv->info);
+	if (priv->registered) {
+		unregister_netdevice(priv->dev);
+		free_netdev(priv->dev);
+	}
+	rtnl_unlock();
+}
 
 static void remove_all_ports(void)
 {
@@ -811,13 +874,7 @@ static void remove_all_ports(void)
 	list_for_each_safe(ele, next, &bpfnic_devices) {
 		priv = list_entry(ele, struct bpfnic_priv, list);
 		list_del(ele);
-		if (priv->opened)
-			bpfnic_close(priv->dev);
-		rtnl_lock();
-		destroy_bpfnic_info(priv->info);
-		unregister_netdevice(priv->dev);
-		free_netdev(priv->dev);
-		rtnl_unlock();
+		remove_one_port(priv);
 	}
 }
 
@@ -872,14 +929,116 @@ static struct notifier_block bpfnic_switchdev_notifier = {
 	.notifier_call = bpfnic_switchdev_event,
 };
 
-static int bpfnic_probe(struct platform_device *pdev)
+
+static int new_bpfnic(void)
 {
 	struct net_device *dev;
-	struct bpfnic_priv *priv;
+	struct bpfnic_priv *priv = NULL;
 	int err = 0, i;
-	char *ifname, *peernames;
-	bool platform_init = true;
 	struct kobject *bpfnic_obj;
+
+	dev = alloc_etherdev_mq(sizeof(struct bpfnic_priv), MAX_QUEUES);
+	if (!dev) {
+		err = -ENOMEM;
+		goto fail_port;
+	}
+
+
+	priv = netdev_priv(dev);
+	priv->info = init_bpfnic_info();
+	priv->opened = false;
+	priv->registered = false;
+	priv->running = false;
+	priv->peer = NULL;
+
+	if (!priv->info)
+		goto fail_port;
+
+	priv->info->peername = NULL;
+	priv->bpf = kzalloc(sizeof(struct bpf_prog *) * HOOKS_COUNT, GFP_KERNEL);
+	if (!priv->bpf) {
+		netdev_err(dev, "Cannot allocate BPF firmware hooks");
+		err = -ENOMEM;
+		goto fail_port;
+	}
+
+	priv->dev = dev;
+
+	for (i = 0; i < HOOKS_COUNT; i++) {
+		priv->info->bpf_names[i] =
+			kstrdup(default_bpfnic_info->bpf_names[i], GFP_KERNEL);
+	}
+
+	bpfnic_setup(dev);
+
+	INIT_LIST_HEAD(&priv->list);
+	spin_lock(&bpfnic_devices_lock);
+	list_add_tail(&priv->list, &bpfnic_devices);
+	spin_unlock(&bpfnic_devices_lock);
+
+	rtnl_lock();
+	err = register_netdevice(dev);
+	rtnl_unlock();
+
+	if (err)
+		goto fail_port;
+	priv->registered = true;
+
+	bpfnic_obj = &dev->dev.kobj;
+
+	err = sysfs_create_group(bpfnic_obj, &bpfnic_group);
+	if (err) {
+		pr_info("%s: can't create group %s/%s\n",
+			__func__, dev->name, bpfnic_group.name);
+		goto fail_port;
+	}
+	return 0;
+fail_port:
+	if (priv)
+		remove_one_port(priv);
+	return err;
+}
+/* global sysfs interface */
+static ssize_t add_interface_store(struct device *d,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	int err;
+	err = new_bpfnic();
+	if (err)
+		return err;
+	return len;
+}
+
+static DEVICE_ATTR_WO(add_interface);
+
+static ssize_t del_interface_store(struct device *d,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	return -EINVAL;
+}
+
+static DEVICE_ATTR_WO(del_interface);
+
+static struct attribute *bpfctrl_attrs[] = {
+	&dev_attr_add_interface.attr,
+	&dev_attr_del_interface.attr,
+	NULL
+};
+
+#define SYSFS_BPFCONTROL_ATTR	"bpfcontrol"
+
+static const struct attribute_group bpfctrl_group = {
+	.name = SYSFS_BPFCONTROL_ATTR,
+	.attrs = bpfctrl_attrs,
+};
+
+
+static int bpfnic_probe(struct platform_device *pdev)
+{
+	struct kobject *bpfctrl_obj;
+	int err = -ENOMEM;
 
 	default_bpfnic_info = init_bpfnic_info();
 	if (!default_bpfnic_info)
@@ -892,90 +1051,11 @@ static int bpfnic_probe(struct platform_device *pdev)
 		goto err_free;
 	}
 
-	kernel_param_lock(THIS_MODULE);
-	default_bpfnic_info->peername = kstrdup(target_iface, GFP_KERNEL);
-	default_bpfnic_info->bpf_names[INGRESS_HOOK] = kstrdup(ingress, GFP_KERNEL);
-	default_bpfnic_info->bpf_names[EGRESS_HOOK] = kstrdup(egress, GFP_KERNEL);
-	kernel_param_unlock(THIS_MODULE);
-
-	if ((!default_bpfnic_info->peername) ||
-		(!default_bpfnic_info->bpf_names[INGRESS_HOOK]) ||
-		(!default_bpfnic_info->bpf_names[EGRESS_HOOK]))
+	bpfctrl_obj = &pdev->dev.kobj;
+	err = sysfs_create_group(bpfctrl_obj, &bpfctrl_group);
+	if (err) {
+		printk(KERN_ERR "bpfnic - can't create control group\n");
 		goto err_free;
-
-	peernames = default_bpfnic_info->peername;
-
-	if (!peernames) {
-		err = -ENOMEM;
-		goto err_free;
-	}
-
-	while (strlen(peernames) > 1) {
-
-		ifname = peernames;
-
-		while (strlen(peernames) > 1) {
-			peernames++;
-			if (peernames[0] == ',') {
-				peernames[0] = '\0';
-				peernames++;
-				break;
-			}
-		}
-
-		dev = alloc_etherdev_mq(sizeof(struct bpfnic_priv), MAX_QUEUES);
-		if (!dev) {
-			err = -ENOMEM;
-			goto err_free;
-		}
-
-		priv = netdev_priv(dev);
-		priv->info = init_bpfnic_info();
-		if (!priv->info)
-			goto err_free;
-
-		priv->info->peername = ifname;
-		priv->bpf = kzalloc(sizeof(struct bpf_prog *) * HOOKS_COUNT, GFP_KERNEL);
-		if (!priv->bpf) {
-			netdev_err(dev, "Cannot allocate BPF firmware hooks");
-			err = -ENOMEM;
-			goto err_free;
-		}
-
-		priv->dev = dev;
-
-		for (i = 0; i < HOOKS_COUNT; i++) {
-			priv->info->bpf_names[i] =
-				kstrdup(default_bpfnic_info->bpf_names[i], GFP_KERNEL);
-		}
-
-		bpfnic_setup(dev);
-
-		INIT_LIST_HEAD(&priv->list);
-		spin_lock(&bpfnic_devices_lock);
-		list_add_tail(&priv->list, &bpfnic_devices);
-		spin_unlock(&bpfnic_devices_lock);
-
-		rtnl_lock();
-		err = register_netdevice(dev);
-		rtnl_unlock();
-
-		bpfnic_obj = &dev->dev.kobj;
-
-		err = sysfs_create_group(bpfnic_obj, &bpfnic_group);
-		if (err) {
-			pr_info("%s: can't create group %s/%s\n",
-				__func__, dev->name, bpfnic_group.name);
-			goto err_free;
-		}
-
-		if (err) {
-			goto err_free;
-		}
-		if (platform_init) {
-			platform_set_drvdata(pdev, dev);
-			platform_init = false;
-		}
 	}
 	err = register_switchdev_notifier(&bpfnic_switchdev_notifier);
 	if (err) {
@@ -1071,15 +1151,6 @@ static __exit void bpfnic_exit(void)
 
 module_init(bpfnic_init);
 module_exit(bpfnic_exit);
-
-module_param(target_iface, charp, 0);
-MODULE_PARM_DESC(target_iface, "Comma separated target interface list");
-
-module_param(ingress, charp, 0);
-MODULE_PARM_DESC(ingress, "Default ingress Hook");
-
-module_param(egress, charp, 0);
-MODULE_PARM_DESC(egress, "Default egress hook");
 
 MODULE_AUTHOR("Anton Ivanov <anton.ivanov@cambridgegreys.com>");
 MODULE_DESCRIPTION("Ethernet NIC with BPF 'firmware'");
