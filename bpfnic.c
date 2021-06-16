@@ -113,6 +113,23 @@ static struct bpfnic_priv *find_bpfnic_by_dev(struct net_device *dev)
 	return device;
 }
 
+static struct bpfnic_priv *find_bpfnic_by_name(char *name)
+{
+	struct bpfnic_priv *device;
+	struct list_head *ele;
+
+	spin_lock(&bpfnic_devices_lock);
+	list_for_each(ele, &bpfnic_devices) {
+		device = list_entry(ele, struct bpfnic_priv, list);
+		if ((device->dev->name) &&
+			(strcmp(device->dev->name, name) == 0))
+			goto out;
+	}
+	device = NULL;
+ out:
+	spin_unlock(&bpfnic_devices_lock);
+	return device;
+}
 #define to_bpfnic(cd)	((struct bpfnic_priv *)netdev_priv(to_net_dev(cd)))
 #define to_maindev(cd)	(to_platform_device(cd))
 
@@ -146,42 +163,37 @@ static int reload_bpf(struct net_device *dev, int index)
 	return ret;
 }
 
+static char *strip_and_dup(const char *buf, size_t len)
+{
+	char *result, *term_nl;
+        ssize_t pos = 0;
+
+	result = kstrdup(buf, GFP_ATOMIC);
+	if (result) {
+		term_nl = result;
+		while ((*term_nl != 0) && (pos < len)) {
+			if (isspace(*term_nl) || (*term_nl == '\n')) {
+				*term_nl = '\0';
+				break;
+			}
+			pos++;
+			term_nl++;
+		}
+	}
+	return result;
+}
+
 static int set_bpf_name(struct bpfnic_priv *priv, const char *buf, size_t len, int index)
 {
-	char *term_nl, pos = 0;
-	char *old = NULL;
+	char *old;
 
-	if (priv->info->bpf_names[index]) {
-		if (strlen(priv->info->bpf_names[index]) < len) {
-			kfree(priv->info->bpf_names[index]);
-			priv->info->bpf_names[index] = kmalloc(len + 1, GFP_ATOMIC);
-			if (!priv->info->bpf_names[index])
-				return -ENOMEM;
-		}
-		if (priv->info->bpf_names[index]) {
-			old = kstrdup(priv->info->bpf_names[index], GFP_ATOMIC); 
-			if (!old)
-				return -ENOMEM;
-		} 
-	} else {
-		priv->info->bpf_names[index] = kmalloc(len + 1, GFP_ATOMIC);
-		if (!priv->info->bpf_names[index])
-			return -ENOMEM;
-	}
-	strncpy(priv->info->bpf_names[index], buf, len);
-	term_nl = priv->info->bpf_names[index];
-	while (*term_nl != '\0' && pos < len) {
-		if (isspace(*term_nl) || (*term_nl == '\n')) {
-			*term_nl = '\0';
-			break;
-		}
-		term_nl++;
-		pos++;
-	}
+	old = priv->info->bpf_names[index];
+	priv->info->bpf_names[index] = strip_and_dup(buf, len);
+
 	if (priv->opened) {
 		if (reload_bpf(priv->dev, index)) {
-			if (old)
-				strcpy(priv->info->bpf_names[index], old);
+			kfree(priv->info->bpf_names[index]);
+			priv->info->bpf_names[index] = old;
 			return -EINVAL;
 		}
 	}
@@ -276,8 +288,8 @@ static ssize_t peer_store(struct device *d,
 				  const char *buf, size_t len)
 {
 	struct bpfnic_priv *priv = to_bpfnic(d);
-	int pos = 0, err = len;
-	char *term_nl, *result; 
+	int err = len;
+	char *old; 
 	
 	spin_lock(&priv->lock);
 	if (priv->opened) {
@@ -285,27 +297,13 @@ static ssize_t peer_store(struct device *d,
 		goto done;
 	}
 	
-	term_nl = kstrdup(buf, GFP_ATOMIC);
-	if (!term_nl) {
-		err = -ENOMEM;
-		goto done;
-	}
-	result = term_nl;
-
-	while (*term_nl != '\0' && pos < len) {
-		if (isspace(*term_nl) || (*term_nl == '\n')) {
-			*term_nl = '\0';
-			break;
-		}
-		term_nl++;
-		pos++;
-	}
-
-	if (strlen(result) > 0) {
-		priv->info->peername = result;
-	}
-	else
-		err =  -EINVAL;
+	old = priv->info->peername;
+	priv->info->peername = strip_and_dup(buf, len);
+	if ((!priv->info->peername) || (strlen(priv->info->peername) == 0)) {
+		err = -EINVAL;
+		kfree(priv->info->peername);
+		priv->info->peername = old;
+	}	
 
 	spin_unlock(&priv->lock);
 done:
@@ -1016,7 +1014,26 @@ static ssize_t del_interface_store(struct device *d,
 				  struct device_attribute *attr,
 				  const char *buf, size_t len)
 {
-	return -EINVAL;
+	char  *iface;
+	int err = len;
+	struct bpfnic_priv *priv = NULL;
+
+	iface = strip_and_dup(buf, len);
+	if ((!iface) || (strlen(iface) == 0)) {
+		err = -EINVAL;
+	} else {
+		priv = find_bpfnic_by_name(iface);
+		if (priv) {
+			if (priv->opened)
+				err = -EBUSY;
+			else
+				remove_one_port(priv);
+		} else {
+			err = -ENOENT;
+		}
+	}
+	kfree(iface);
+	return err;
 }
 
 static DEVICE_ATTR_WO(del_interface);
@@ -1027,7 +1044,7 @@ static struct attribute *bpfctrl_attrs[] = {
 	NULL
 };
 
-#define SYSFS_BPFCONTROL_ATTR	"bpfcontrol"
+#define SYSFS_BPFCONTROL_ATTR	"interfaces"
 
 static const struct attribute_group bpfctrl_group = {
 	.name = SYSFS_BPFCONTROL_ATTR,
