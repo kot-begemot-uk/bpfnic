@@ -49,7 +49,9 @@ struct bpfnic_stats {
 
 #define INGRESS_HOOK			0
 #define EGRESS_HOOK			1
-#define HOOKS_COUNT			2
+#define MCAST_HOOK			2
+#define FORWARD_HOOK			3
+#define HOOKS_COUNT			4
 
 #define FDB_MAP				0
 #define MAPS_COUNT			1
@@ -89,6 +91,8 @@ static struct workqueue_struct *bpfnic_workq;
 static char* prog_names[] = {
 	"ingress",
 	"egress",
+	"mcast",
+	"forward",
 	NULL
 };
 
@@ -291,6 +295,42 @@ static ssize_t egress_hook_store(struct device *d,
 
 static DEVICE_ATTR_RW(egress_hook);
 
+static ssize_t mcast_hook_show(struct device *d,
+				 struct device_attribute *attr,
+				 char *buf)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	return sprintf(buf, "%s\n", priv->info->bpf_names[MCAST_HOOK]);
+}
+
+static ssize_t mcast_hook_store(struct device *d,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	return set_bpf_name(priv, buf, len, MCAST_HOOK);
+}
+
+static DEVICE_ATTR_RW(mcast_hook);
+
+static ssize_t forward_hook_show(struct device *d,
+				 struct device_attribute *attr,
+				 char *buf)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	return sprintf(buf, "%s\n", priv->info->bpf_names[FORWARD_HOOK]);
+}
+
+static ssize_t forward_hook_store(struct device *d,
+				  struct device_attribute *attr,
+				  const char *buf, size_t len)
+{
+	struct bpfnic_priv *priv = to_bpfnic(d);
+	return set_bpf_name(priv, buf, len, FORWARD_HOOK);
+}
+
+static DEVICE_ATTR_RW(forward_hook);
+
 static ssize_t fdb_map_show(struct device *d,
 				 struct device_attribute *attr,
 				 char *buf)
@@ -348,6 +388,8 @@ static DEVICE_ATTR_RW(peer);
 static struct attribute *bpfnic_attrs[] = {
 	&dev_attr_ingress_hook.attr,
 	&dev_attr_egress_hook.attr,
+	&dev_attr_mcast_hook.attr,
+	&dev_attr_forward_hook.attr,
 	&dev_attr_fdb_map.attr,
 	&dev_attr_peer.attr,
 	NULL
@@ -570,6 +612,33 @@ static inline struct bpfnic_priv *bpfnic_peer_get_rcu(const struct net_device *d
 	return rcu_dereference(dev->rx_handler_data);
 }
 
+static int frame_type(struct sk_buff *pskb, struct bpfnic_priv *priv)
+{
+	struct netdev_hw_addr *ha;
+	int ret = FORWARD_HOOK;
+	
+	/* we do not make any difference between local and forwarded
+	 * mcast hooks for now */
+
+	if (is_multicast_ether_addr(eth_hdr(pskb)->h_dest))
+		return MCAST_HOOK;
+	
+	if (ether_addr_equal(eth_hdr(pskb)->h_dest, priv->dev->dev_addr))	
+		return INGRESS_HOOK;
+
+	netif_addr_lock_bh(priv->dev);
+	list_for_each_entry(ha, &priv->dev->uc.list, list) {
+		if (ether_addr_equal(ha->addr, eth_hdr(pskb)->h_dest) &&
+		    ha->type == NETDEV_HW_ADDR_T_UNICAST) {
+			ret = INGRESS_HOOK;
+			goto out;
+		}
+	}
+out:
+	netif_addr_unlock_bh(priv->dev);
+	return ret;
+}
+
 /*
  * For now - tell the handler to rerun the stack as if the frame is
  * coming on the paired interface.
@@ -578,7 +647,7 @@ static rx_handler_result_t bpfnic_handle_frame(struct sk_buff **pskb)
 {
 	struct bpfnic_priv *priv;
 	struct sk_buff *skb = *pskb;
-	int bpf_ret = 1;
+	int bpf_ret = 1, hook;
 
 	priv = bpfnic_peer_get_rcu(skb->dev);
 
@@ -589,25 +658,29 @@ static rx_handler_result_t bpfnic_handle_frame(struct sk_buff **pskb)
 
 	/* bpf program invocation goes in here */
 
-	if ((priv) && (priv->bpf[INGRESS_HOOK])) 
-		bpf_ret = BPF_PROG_RUN(priv->bpf[INGRESS_HOOK], skb);
 
-	if (priv && (bpf_ret > 0)) {
-		atomic64_inc(&priv->rx_packets);
-		atomic64_add(skb->len, &priv->rx_bytes);
-		skb->dev = priv->dev;
-		skb_forward_csum(skb);
-		if (is_multicast_ether_addr(eth_hdr(skb)->h_dest) ||
-				ether_addr_equal(eth_hdr(skb)->h_dest, priv->dev->dev_addr)) {
-			netif_receive_skb(skb);
-			return RX_HANDLER_CONSUMED;
-		} 
-	} else {
+	hook = frame_type(*pskb, priv);
+	if (priv->bpf[hook]) 
+		bpf_ret = BPF_PROG_RUN(priv->bpf[hook], skb);
+
+	/* standard socket filter conventions - 0 is drop */
+	
+	if (bpf_ret == 0) {
 		kfree_skb(skb);
 		return RX_HANDLER_CONSUMED;
-		
 	}
-	return RX_HANDLER_ANOTHER;
+
+	atomic64_inc(&priv->rx_packets);
+	atomic64_add(skb->len, &priv->rx_bytes);
+	skb->dev = priv->dev;
+	skb_forward_csum(skb);
+
+	if (hook == FORWARD_HOOK) {
+		return RX_HANDLER_ANOTHER;
+	} 
+
+	netif_receive_skb(skb);
+	return RX_HANDLER_CONSUMED;
 }
 
 static int bpfnic_open(struct net_device *dev)
