@@ -47,15 +47,17 @@ struct bpfnic_stats {
 	u64	rx_drops;
 };
 
-#define INGRESS_HOOK	0
-#define EGRESS_HOOK	1
-#define FDB_ADD_HOOK	2
-#define FDB_DEL_HOOK	3
-#define HOOKS_COUNT	4
+#define INGRESS_HOOK			0
+#define EGRESS_HOOK			1
+#define HOOKS_COUNT			2
+
+#define FDB_MAP				0
+#define MAPS_COUNT			1
 
 struct bpfnic_info {
 	char *peername;
 	char **bpf_names;
+	char **map_names;
 	int unit;
 };
 
@@ -68,6 +70,7 @@ struct bpfnic_priv {
 	atomic64_t		dropped;
 	/* bpf hooks */
 	struct			bpf_prog **bpf;
+	struct			bpf_map **maps;
 	struct bpfnic_info	*info;
 	spinlock_t		lock;
 	bool			opened;
@@ -86,8 +89,11 @@ static struct workqueue_struct *bpfnic_workq;
 static char* prog_names[] = {
 	"ingress",
 	"egress",
-	"fdb_add",
-	"fdb_del",
+	NULL
+};
+
+static char* map_fnames[] = {
+	"fdb",
 	NULL
 };
 
@@ -152,8 +158,37 @@ static int reload_bpf(struct net_device *dev, int index)
 
 	if (!ret) {
 		if (priv->bpf[index])
-			bpf_prog_sub(priv->bpf[index], 1);
+			bpf_prog_put(priv->bpf[index]);
 		priv->bpf[index] = prog;
+	}
+
+	priv->running = true;
+
+	wmb();
+
+	return ret;
+}
+
+static int reload_map(struct net_device *dev, int index)
+{
+	struct bpfnic_priv *priv = netdev_priv(dev);
+	struct bpf_map *map = NULL;
+	int ret = 0;
+
+	priv->running = false;
+
+	wmb();
+	map = bpf_map_get_path(
+			priv->info->map_names[index], MAY_READ | MAY_WRITE);
+	if (IS_ERR(map)){
+		ret = -EINVAL;
+		netdev_err(dev, "Cannot configure %s map", map_fnames[index]);
+	} 
+
+	if (!ret) {
+		if (priv->maps[index])
+			bpf_map_put(priv->maps[index]);
+		priv->maps[index] = map;
 	}
 
 	priv->running = true;
@@ -166,7 +201,7 @@ static int reload_bpf(struct net_device *dev, int index)
 static char *strip_and_dup(const char *buf, size_t len)
 {
 	char *result, *term_nl;
-        ssize_t pos = 0;
+		  ssize_t pos = 0;
 
 	result = kstrdup(buf, GFP_ATOMIC);
 	if (result) {
@@ -194,6 +229,23 @@ static int set_bpf_name(struct bpfnic_priv *priv, const char *buf, size_t len, i
 		if (reload_bpf(priv->dev, index)) {
 			kfree(priv->info->bpf_names[index]);
 			priv->info->bpf_names[index] = old;
+			return -EINVAL;
+		}
+	}
+	return len;
+}
+
+static int set_bpf_map_name(struct bpfnic_priv *priv, const char *buf, size_t len, int index)
+{
+	char *old;
+
+	old = priv->info->map_names[index];
+	priv->info->map_names[index] = strip_and_dup(buf, len);
+
+	if (priv->opened) {
+		if (reload_map(priv->dev, index)) {
+			kfree(priv->info->map_names[index]);
+			priv->info->map_names[index] = old;
 			return -EINVAL;
 		}
 	}
@@ -239,41 +291,23 @@ static ssize_t egress_hook_store(struct device *d,
 
 static DEVICE_ATTR_RW(egress_hook);
 
-static ssize_t fdb_add_hook_show(struct device *d,
+static ssize_t fdb_map_show(struct device *d,
 				 struct device_attribute *attr,
 				 char *buf)
 {
 	struct bpfnic_priv *priv = to_bpfnic(d);
-	return sprintf(buf, "%s\n", priv->info->bpf_names[FDB_ADD_HOOK]);
+	return sprintf(buf, "%s\n", priv->info->map_names[FDB_MAP]);
 }
 
-static ssize_t fdb_add_hook_store(struct device *d,
+static ssize_t fdb_map_store(struct device *d,
 				  struct device_attribute *attr,
 				  const char *buf, size_t len)
 {
 	struct bpfnic_priv *priv = to_bpfnic(d);
-	return set_bpf_name(priv, buf, len, FDB_ADD_HOOK);
+	return set_bpf_map_name(priv, buf, len, FDB_MAP);
 }
 
-static DEVICE_ATTR_RW(fdb_add_hook);
-
-static ssize_t fdb_del_hook_show(struct device *d,
-				 struct device_attribute *attr,
-				 char *buf)
-{
-	struct bpfnic_priv *priv = to_bpfnic(d);
-	return sprintf(buf, "%s\n", priv->info->bpf_names[FDB_ADD_HOOK]);
-}
-
-static ssize_t fdb_del_hook_store(struct device *d,
-				  struct device_attribute *attr,
-				  const char *buf, size_t len)
-{
-	struct bpfnic_priv *priv = to_bpfnic(d);
-	return set_bpf_name(priv, buf, len, FDB_ADD_HOOK);
-}
-
-static DEVICE_ATTR_RW(fdb_del_hook);
+static DEVICE_ATTR_RW(fdb_map);
 
 static ssize_t peer_show(struct device *d,
 				 struct device_attribute *attr,
@@ -282,7 +316,6 @@ static ssize_t peer_show(struct device *d,
 	struct bpfnic_priv *priv = to_bpfnic(d);
 	return sprintf(buf, "%s\n", priv->info->peername);
 }
-
 static ssize_t peer_store(struct device *d,
 				  struct device_attribute *attr,
 				  const char *buf, size_t len)
@@ -315,13 +348,12 @@ static DEVICE_ATTR_RW(peer);
 static struct attribute *bpfnic_attrs[] = {
 	&dev_attr_ingress_hook.attr,
 	&dev_attr_egress_hook.attr,
-	&dev_attr_fdb_add_hook.attr,
-	&dev_attr_fdb_del_hook.attr,
+	&dev_attr_fdb_map.attr,
 	&dev_attr_peer.attr,
 	NULL
 };
 
-#define SYSFS_BPFNIC_ATTR	"bpfhooks"
+#define SYSFS_BPFNIC_ATTR	"bpf"
 
 static const struct attribute_group bpfnic_group = {
 	.name = SYSFS_BPFNIC_ATTR,
@@ -342,6 +374,12 @@ static struct bpfnic_info *init_bpfnic_info(void)
 		kfree(result);
 		return NULL;
 	}
+	result->map_names = kzalloc(sizeof(char *) * MAPS_COUNT, GFP_KERNEL);
+	if (!result->map_names) {
+		kfree(result->bpf_names);
+		kfree(result);
+		return NULL;
+	}
 	return result;
 }
 
@@ -354,6 +392,12 @@ static void destroy_bpfnic_info(struct bpfnic_info *arg)
 				kfree(arg->bpf_names[i]);
 			}
 			kfree(arg->bpf_names);
+		}
+		if (arg->map_names) {
+			for (i = 0; i < MAPS_COUNT; i++) {
+				kfree(arg->map_names[i]);
+			}
+			kfree(arg->map_names);
 		}
 		kfree(arg);
 	}
@@ -385,14 +429,24 @@ bpfnic_fdb_offload_notify(struct bpfnic_priv *priv,
 				 priv->dev, &info.info, NULL);
 }
 
-static void build_switchdev_context(struct bpfnic_notify_context *context,
-		               struct switchdev_notifier_fdb_info *fdb_info)
+static void build_switchdev_entry(struct bpfnic_fdb_entry *entry,
+							struct switchdev_notifier_fdb_info *fdb_info)
 {
-	context->ifindex = fdb_info->info.dev->ifindex;
-	ether_addr_copy((u8 *) &context->addr, fdb_info->addr);
-	context->vid = fdb_info->vid;
-	context->added_by_user = fdb_info->added_by_user;
-	context->offloaded = fdb_info->offloaded;
+	entry->ifindex = fdb_info->info.dev->ifindex;
+	ether_addr_copy((u8 *) &entry->addr, fdb_info->addr);
+	entry->vid = fdb_info->vid;
+	entry->added_by_user = fdb_info->added_by_user;
+	entry->offloaded = fdb_info->offloaded;
+}
+
+static int map_update_elem(struct bpf_map *map, void *key, void *value, u64 flags)
+{
+	return map->ops->map_update_elem(map, key, value, flags);
+}
+
+static int map_delete_elem(struct bpf_map *map, void *key)
+{
+	return map->ops->map_delete_elem(map, key);
 }
 
 static void bpfnic_switchdev_handle_work(struct work_struct *work)
@@ -401,44 +455,35 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 		container_of(work, struct bpfnic_switchdev_event_work, work);
 	struct bpfnic_priv *priv = switchdev_work->priv;
 	struct switchdev_notifier_fdb_info *fdb_info;
-	struct bpfnic_notify_context context;
+	struct bpfnic_fdb_entry *fdb_entry;
+	struct bpf_map *map;
+	int ret;
 
 	rtnl_lock();
 
+	map = priv->maps[FDB_MAP];
+	
 	switch (switchdev_work->event) {
 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
 		fdb_info = &switchdev_work->fdb_info;
-		build_switchdev_context(&context, fdb_info);
-		netdev_dbg(priv->dev, "fdb add %0x:%0x:%0x:%0x:%0x:%0x",
-				context.addr[0],
-				context.addr[1],
-				context.addr[2],
-				context.addr[3],
-				context.addr[4],
-				context.addr[5]);  
-		if (priv->bpf[FDB_ADD_HOOK]) {
-			if (!BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context)) {
-				netdev_err(priv->dev, "fdb add failed");
-			} else {
+		fdb_entry = kmalloc(GFP_ATOMIC, sizeof(struct bpfnic_fdb_entry));
+		if (fdb_entry && map) {
+			build_switchdev_entry(fdb_entry, fdb_info);
+			ret = map_update_elem(map, &fdb_entry->addr,
+					      fdb_entry, BPF_ANY);
+			if (ret)
+				netdev_err(priv->dev, "failed to add fdb element %d", ret);
+			else 
 				bpfnic_fdb_offload_notify(priv, fdb_info);
-			}
-
+		} else {
+			netdev_err(priv->dev, "failed to handle notification");
 		}
 		break;
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
 		fdb_info = &switchdev_work->fdb_info;
-		build_switchdev_context(&context, fdb_info);
-		netdev_dbg(priv->dev, "fdb del %0x:%0x:%0x:%0x:%0x:%0x",
-				context.addr[0],
-				context.addr[1],
-				context.addr[2],
-				context.addr[3],
-				context.addr[4],
-				context.addr[5]);  
-		if (priv->bpf[FDB_DEL_HOOK]) {
-			if(!BPF_PROG_RUN(priv->bpf[EGRESS_HOOK], &context))
-				netdev_info(priv->dev, "fdb del failed");
-		}
+		ret = map_delete_elem(map, &fdb_entry->addr);
+		if (ret)
+			netdev_err(priv->dev, "failed to delete fdb element");
 		break;
 	};
 	rtnl_unlock();
@@ -492,7 +537,7 @@ static netdev_tx_t bpfnic_xmit(struct sk_buff *skb, struct net_device *dev)
 }
 
 static void bpfnic_get_stats64(struct net_device *dev,
-			     struct rtnl_link_stats64 *tot)
+				  struct rtnl_link_stats64 *tot)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	u64 packets = 0, bytes = 0;
@@ -601,6 +646,11 @@ static int bpfnic_open(struct net_device *dev)
 			reload_bpf(dev, i);
 		}
 	}
+	for (i = 0; i < MAPS_COUNT; i++) { 
+		if (priv->info->map_names[i]) {
+			reload_map(dev, i);
+		}
+	}
 
 	atomic64_set(&priv->dropped, 0);
 	atomic64_set(&priv->rx_packets, 0);
@@ -656,6 +706,12 @@ static int bpfnic_close(struct net_device *dev)
 			}
 		}
 		kfree(priv->bpf);
+		for (i = 0; i < MAPS_COUNT; i++) {
+			if (priv->maps[i]) {
+				bpf_map_put(priv->maps[i]);
+			}
+		}
+		kfree(priv->maps);
 	}
 
 	/* note - we do not deallocate bpf programs here as they may be
@@ -783,7 +839,7 @@ static netdev_features_t bpfnic_fix_features(struct net_device *dev,
 }
 
 static int bpfnic_vlan_rx_add_vid(struct net_device *dev,
-						       __be16 proto, u16 vid)
+								 __be16 proto, u16 vid)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
@@ -798,7 +854,7 @@ static int bpfnic_vlan_rx_add_vid(struct net_device *dev,
 }
 
 static int bpfnic_vlan_rx_kill_vid(struct net_device *dev,
-						       __be16 proto, u16 vid)
+								 __be16 proto, u16 vid)
 {
 	struct bpfnic_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
@@ -814,13 +870,13 @@ static int bpfnic_vlan_rx_kill_vid(struct net_device *dev,
 
 
 static const struct net_device_ops bpfnic_netdev_ops = {
-	.ndo_init            = bpfnic_dev_init,
-	.ndo_uninit          = bpfnic_dev_uninit,
-	.ndo_open            = bpfnic_open,
-	.ndo_stop            = bpfnic_close,
-	.ndo_start_xmit      = bpfnic_xmit,
-	.ndo_get_stats64     = bpfnic_get_stats64,
-	.ndo_set_rx_mode     = bpfnic_set_multicast_list,
+	.ndo_init				= bpfnic_dev_init,
+	.ndo_uninit			 = bpfnic_dev_uninit,
+	.ndo_open				= bpfnic_open,
+	.ndo_stop				= bpfnic_close,
+	.ndo_start_xmit		= bpfnic_xmit,
+	.ndo_get_stats64	  = bpfnic_get_stats64,
+	.ndo_set_rx_mode	  = bpfnic_set_multicast_list,
 	.ndo_set_mac_address = eth_mac_addr,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= bpfnic_poll_controller,
@@ -899,8 +955,7 @@ static int bpfnic_switchdev_event(struct notifier_block *unused,
 	switch (event) {
 	case SWITCHDEV_FDB_ADD_TO_DEVICE:
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
-		memcpy(&switchdev_work->fdb_info, ptr,
-		       sizeof(switchdev_work->fdb_info));
+		memcpy(&switchdev_work->fdb_info, ptr, sizeof(switchdev_work->fdb_info));
 		switchdev_work->fdb_info.addr = kzalloc(ETH_ALEN, GFP_ATOMIC);
 		if (unlikely(!switchdev_work->fdb_info.addr)) {
 			kfree(switchdev_work);
@@ -956,6 +1011,12 @@ static int new_bpfnic(void)
 	priv->bpf = kzalloc(sizeof(struct bpf_prog *) * HOOKS_COUNT, GFP_KERNEL);
 	if (!priv->bpf) {
 		netdev_err(dev, "Cannot allocate BPF firmware hooks");
+		err = -ENOMEM;
+		goto fail_port;
+	}
+	priv->maps = kzalloc(sizeof(struct bpf_map *) * MAPS_COUNT, GFP_KERNEL);
+	if (!priv->maps) {
+		netdev_err(dev, "Cannot allocate BPF maps for IPC");
 		err = -ENOMEM;
 		goto fail_port;
 	}
