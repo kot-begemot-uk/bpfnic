@@ -158,7 +158,7 @@ static int reload_bpf(struct net_device *dev, int index)
 	if (IS_ERR(prog)){
 		ret = -EINVAL;
 		netdev_err(dev, "Cannot configure %s hook", prog_names[index]);
-	} 
+	}
 
 	if (!ret) {
 		if (priv->bpf[index])
@@ -184,12 +184,11 @@ static int reload_map(struct net_device *dev, int index)
 	wmb();
 	map = bpf_map_get_path(
 			priv->info->map_names[index], MAY_READ | MAY_WRITE);
-	if (IS_ERR(map)){
-		ret = -EINVAL;
-		netdev_err(dev, "Cannot configure %s map", map_fnames[index]);
-	} 
 
-	if (!ret) {
+	if (IS_ERR(map) || ((map == NULL) && (priv->info->map_names[index]))){
+		ret = -EINVAL;
+		netdev_err(dev, "Cannot configure %s map %s", map_fnames[index], priv->info->map_names[index]);
+	} else {
 		if (priv->maps[index])
 			bpf_map_put(priv->maps[index]);
 		priv->maps[index] = map;
@@ -362,7 +361,7 @@ static ssize_t peer_store(struct device *d,
 {
 	struct bpfnic_priv *priv = to_bpfnic(d);
 	int err = len;
-	char *old; 
+	char *old;
 	
 	spin_lock(&priv->lock);
 	if (priv->opened) {
@@ -408,7 +407,7 @@ static struct bpfnic_info *init_bpfnic_info(void)
 
 	result = kzalloc(sizeof(struct bpfnic_info), GFP_KERNEL);
 
-	if (!result) 
+	if (!result)
 		return NULL;
 
 	result->bpf_names = kzalloc(sizeof(char *) * HOOKS_COUNT, GFP_KERNEL);
@@ -514,18 +513,20 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 			ret = map_update_elem(map, &fdb_entry->addr,
 					      fdb_entry, BPF_ANY);
 			if (ret)
-				netdev_err(priv->dev, "failed to add fdb element %d", ret);
-			else 
+				netdev_err(priv->dev, "failed to add fdb element err: %d", ret);
+			else
 				bpfnic_fdb_offload_notify(priv, fdb_info);
 		} else {
-			netdev_err(priv->dev, "failed to handle notification");
+			kfree(fdb_entry);
 		}
 		break;
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
-		fdb_info = &switchdev_work->fdb_info;
-		ret = map_delete_elem(map, &fdb_entry->addr);
-		if (ret)
-			netdev_err(priv->dev, "failed to delete fdb element");
+		if (map) {
+			fdb_info = &switchdev_work->fdb_info;
+			ret = map_delete_elem(map, &fdb_entry->addr);
+			if (ret)
+				netdev_err(priv->dev, "failed to delete fdb element err: %d", ret);
+		}
 		break;
 	};
 	rtnl_unlock();
@@ -660,7 +661,7 @@ static rx_handler_result_t bpfnic_handle_frame(struct sk_buff **pskb)
 
 
 	hook = frame_type(*pskb, priv);
-	if (priv->bpf[hook]) 
+	if (priv->bpf[hook])
 		bpf_ret = BPF_PROG_RUN(priv->bpf[hook], skb);
 
 	/* standard socket filter conventions - 0 is drop */
@@ -677,7 +678,7 @@ static rx_handler_result_t bpfnic_handle_frame(struct sk_buff **pskb)
 
 	if (hook == FORWARD_HOOK) {
 		return RX_HANDLER_ANOTHER;
-	} 
+	}
 
 	netif_receive_skb(skb);
 	return RX_HANDLER_CONSUMED;
@@ -714,12 +715,12 @@ static int bpfnic_open(struct net_device *dev)
 
 	eth_hw_addr_inherit(dev, priv->peer);
 
-	for (i = 0; i < HOOKS_COUNT; i++) { 
+	for (i = 0; i < HOOKS_COUNT; i++) {
 		if (priv->info->bpf_names[i]) {
 			reload_bpf(dev, i);
 		}
 	}
-	for (i = 0; i < MAPS_COUNT; i++) { 
+	for (i = 0; i < MAPS_COUNT; i++) {
 		if (priv->info->map_names[i]) {
 			reload_map(dev, i);
 		}
@@ -876,7 +877,7 @@ static void bpfnic_set_rx_headroom(struct net_device *dev, int new_hr)
 	peer = rcu_dereference(priv->peer);
 	if (unlikely(!peer))
 		goto out;
-	if (peer->netdev_ops->ndo_set_rx_headroom) 
+	if (peer->netdev_ops->ndo_set_rx_headroom)
 		peer->netdev_ops->ndo_set_rx_headroom(peer, new_hr);
 out:
 	rcu_read_unlock();
@@ -1262,7 +1263,7 @@ static struct platform_device *bpfnic;
 
 static __init int bpfnic_init(void)
 {
-	int ret;  
+	int ret;
 
 	ret = platform_driver_register(&bpfnic_driver);
 
