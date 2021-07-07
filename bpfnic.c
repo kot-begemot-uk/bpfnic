@@ -523,7 +523,7 @@ static void bpfnic_switchdev_handle_work(struct work_struct *work)
 	case SWITCHDEV_FDB_DEL_TO_DEVICE:
 		if (map) {
 			fdb_info = &switchdev_work->fdb_info;
-			ret = map_delete_elem(map, &fdb_entry->addr);
+			ret = map_delete_elem(map, &fdb_info->addr);
 			if (ret)
 				netdev_err(priv->dev, "failed to delete fdb element err: %d", ret);
 		}
