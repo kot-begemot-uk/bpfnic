@@ -1,0 +1,91 @@
+From 9ec514054cfc0e89316843cb9c8e034424d0962b Mon Sep 17 00:00:00 2001
+From: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+Date: Tue, 6 Jul 2021 10:58:33 +0100
+Subject: Add support for getting a map by it's fs name
+
+This adds support for obtaining a map by it's pinned name similar
+to bpf_prog_get_type_path().
+
+This allows kernel modules to get a reference of an existing
+pinned bpf map and use it.
+
+There is no alternative method to do that at present - existing
+bpf map by fd functions are not exported so modules do not have
+access to them.
+
+Signed-off-by: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 02b02cb29ce2..3e1d46f32d33 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1516,6 +1516,7 @@ static inline int bpf_map_attr_numa_node(const union bpf_attr *attr)
+ }
+ 
+ struct bpf_prog *bpf_prog_get_type_path(const char *name, enum bpf_prog_type type);
++struct bpf_map *bpf_map_get_path(const char *name, fmode_t fmode);
+ int array_map_alloc_check(union bpf_attr *attr);
+ 
+ int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
+@@ -1699,6 +1700,11 @@ static inline struct bpf_prog *bpf_prog_get_type_path(const char *name,
+ 	return ERR_PTR(-EOPNOTSUPP);
+ }
+ 
++static inline struct bpf_map *bpf_map_get_path(const char *name, fmode_t fmode)
++{
++	return ERR_PTR(-EOPNOTSUPP);
++}
++
+ static inline int bpf_prog_test_run_xdp(struct bpf_prog *prog,
+ 					const union bpf_attr *kattr,
+ 					union bpf_attr __user *uattr)
+diff --git a/kernel/bpf/inode.c b/kernel/bpf/inode.c
+index b4ebd60a6c16..f40817059c5d 100644
+--- a/kernel/bpf/inode.c
++++ b/kernel/bpf/inode.c
+@@ -556,6 +556,45 @@ int bpf_obj_get_user(const char __user *pathname, int flags)
+ 	return ret;
+ }
+ 
++static struct bpf_map *__get_map_inode(struct inode *inode, fmode_t fmode)
++{
++	struct bpf_map *map;
++	int ret = inode_permission(&init_user_ns, inode, fmode);
++	if (ret)
++		return ERR_PTR(ret);
++
++	if (inode->i_op == &bpf_prog_iops)
++		return ERR_PTR(-EINVAL);
++	if (inode->i_op == &bpf_link_iops)
++		return ERR_PTR(-EINVAL);
++	if (inode->i_op != &bpf_map_iops)
++		return ERR_PTR(-EACCES);
++
++	map = inode->i_private;
++
++	ret = security_bpf_map(map, fmode);
++	if (ret < 0)
++		return ERR_PTR(ret);
++
++	bpf_map_inc(map);
++	return map;
++}
++
++struct bpf_map *bpf_map_get_path(const char *name, fmode_t fmode)
++{
++	struct bpf_map *map;
++	struct path path;
++	int ret = kern_path(name, LOOKUP_FOLLOW, &path);
++	if (ret)
++		return ERR_PTR(ret);
++	map = __get_map_inode(d_backing_inode(path.dentry), fmode);
++	if (!IS_ERR(map))
++		touch_atime(&path);
++	path_put(&path);
++	return map;
++}
++EXPORT_SYMBOL(bpf_map_get_path);
++
+ static struct bpf_prog *__get_prog_inode(struct inode *inode, enum bpf_prog_type type)
+ {
+ 	struct bpf_prog *prog;
